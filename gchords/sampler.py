@@ -439,8 +439,8 @@ class BaumgardtMassLightRatioModel(MassLightRatioModel):
     '''
     def __init__(self):
         self.mu1 = 0.62
-        self.mu2 = 0.2
-        self.sigma1 = 0.69
+        self.sigma1 = 0.2
+        self.mu2 = 0.69
         self.sigma2 = 0.88
         self.w = 0.91
 
