@@ -43,6 +43,7 @@ class SymphonyInterface(Interface):
             "cosmo", params=self.cosmology_parameters
         )
         self.scale_factors = np.array(symlib.scale_factors(sim_dir))
+        self.z0_snap = int(np.argmin(np.abs(self.scale_factors - 1.0)))
 
         self.rs, self.hist = symlib.read_rockstar(sim_dir)
         self.infall_properties["infall_snapshot"] = self.hist["first_infall_snap"]
@@ -162,13 +163,13 @@ class SymphonyInterface(Interface):
         candidates[1:] = True # exclude host
         
         # intact at z=0
-        candidates &= self.rs[:, -1]['ok']
+        candidates &= self.rs[:, self.z0_snap]['ok']
         # infall selection
         candidates &= (self.infall_properties["infall_snapshot"] >= 0) & \
               (self.infall_properties["infall_snapshot"] < len(self.scale_factors))
         candidates &= self.scale_factors[self.infall_properties["infall_snapshot"]] > 0.86
         # distance selection at z=0
-        d = np.linalg.norm(self.rs[:, -1]['x'], axis=-1)
+        d = np.linalg.norm(self.rs[:, self.z0_snap]['x'], axis=-1)
         candidates &= (d > 30) & (d < 70)
         # mass selection
         candidates &= self.hist['vpeak'] > 55
