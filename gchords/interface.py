@@ -44,21 +44,21 @@ class SymphonyInterface(Interface):
         )
         self.scale_factors = np.array(symlib.scale_factors(sim_dir))
 
-        self.rs, hist = symlib.read_rockstar(sim_dir)
-        self.infall_properties["infall_snapshot"] = hist["first_infall_snap"]
+        self.rs, self.hist = symlib.read_rockstar(sim_dir)
+        self.infall_properties["infall_snapshot"] = self.hist["first_infall_snap"]
         self.infall_properties["halo_mass"] = self.rs["m"][
-            np.arange(self.rs.shape[0]), hist["first_infall_snap"]
+            np.arange(self.rs.shape[0]), self.hist["first_infall_snap"]
         ]
 
         # If UM outputs are available, read them. If not, compute them using the fit.
         if read_um:
             um = symlib.read_um(sim_dir)
             self.infall_properties["stellar_mass"] = um["m_star"][
-                np.arange(um["m_star"].shape[0]), hist["first_infall_snap"]
+                np.arange(um["m_star"].shape[0]), self.hist["first_infall_snap"]
             ]
         else:
-            mpeaks = hist["mpeak"]
-            infall_z = 1 / self.scale_factors[hist["first_infall_snap"]] - 1
+            mpeaks = self.hist["mpeak"]
+            infall_z = 1 / self.scale_factors[self.hist["first_infall_snap"]] - 1
             fit = UniverseMachineMStarFit()
             self.infall_properties["stellar_mass"] = np.array(
                 [fit.m_star(mp_i, z_i) for mp_i, z_i in zip(mpeaks, infall_z)]
@@ -73,7 +73,7 @@ class SymphonyInterface(Interface):
         disrupt_snap[disrupt_snap == self.rs.shape[1]] = -1
         self.infall_properties["disrupt_snapshot"] = disrupt_snap
 
-        self.infall_properties["preinfall_host_idx"] = symlib.pre_infall_host(hist)
+        self.infall_properties["preinfall_host_idx"] = symlib.pre_infall_host(self.hist)
 
         self.particles = symlib.Particles(self.sim_dir)
 
@@ -146,6 +146,7 @@ class SymphonyInterface(Interface):
             gse_index = np.where(candidates)[0][np.argmax(self.infall_properties["halo_mass"][candidates])]
             return gse_index
         else:
+            print('no GSE found')
             return None
 
     def get_lmc_index(self):
@@ -177,4 +178,5 @@ class SymphonyInterface(Interface):
             lmc_index = np.where(candidates)[0][np.argmax(self.hist['vpeak'][candidates])]
             return lmc_index
         else:
+            print('no LMC found')
             return None
