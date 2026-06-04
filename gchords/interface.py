@@ -77,6 +77,40 @@ class SymphonyInterface(Interface):
 
         self.particles = symlib.Particles(self.sim_dir)
 
+    def disrupts(self):
+        '''
+        Returns a boolean array of length (N_subhalos) indicating if a subhalo 
+        disrupts at some point, and the index of first False after the last True.
+        
+        Returns:
+            res          : list of booleans, length N_subhalos
+            disrupt_index: list of int or None, length N_subhalos
+        '''
+
+        res = []
+        disrupt_index = []
+
+        for subhalo in range(self.rs[0].shape):
+            row = self.rs[subhalo, :]
+
+            transitions = False
+            seen_true = False
+
+            for i, k in enumerate(row):
+                if k:
+                    seen_true = True
+                elif seen_true:
+                    transitions = True
+                    disrupt_index.append(i)  # first False after last True
+                    break
+            
+            if not transitions:
+                disrupt_index.append(None)
+
+            res.append(transitions)
+
+        return res, disrupt_index
+
     def get_gse_index(self):
         '''
         returns the GSE halo based on the Buch+2024 (https://arxiv.org/abs/2404.08043) criteria
@@ -91,9 +125,15 @@ class SymphonyInterface(Interface):
         candidates = np.zeros(len(self.infall_properties["infall_snapshot"]), dtype=bool)
         candidates[1:] = True # exclude host
 
-        infall_redshifts = 1 / self.scale_factors[self.infall_properties["infall_snapshot"]] - 1
         candidates &= (self.infall_properties["infall_snapshot"] >= 0) & (self.infall_properties["infall_snapshot"] < len(self.scale_factors))
-        candidates &= (infall_redshifts > 0.67) & (infall_redshifts < 3.0)
+        # checks if GSE has disrupted
+        disrupts, s_disrupt = self.disrupts()
+        candidates &= disrupts
+
+        # check if self.scale_factors[s_disrupt] is between 0.25 < a_disrupt < 0.6 
+        s_disrupt_arr = np.array([s if s is not None else -1 for s in s_disrupt])
+        a_disrupt = np.where(s_disrupt_arr >= 0, self.scale_factors[s_disrupt_arr], np.nan)
+        candidates &= (a_disrupt > 0.25) & (a_disrupt < 0.6)
 
         # mass ratio condition: Msub/Mhost > 0.2 at the snapshot of peak subhalo mass
         masked_masses = np.where(self.rs["ok"], self.rs["m"], 0.0)
@@ -106,4 +146,35 @@ class SymphonyInterface(Interface):
             gse_index = np.where(candidates)[0][np.argmax(self.infall_properties["halo_mass"][candidates])]
             return gse_index
         else:
-            return -1
+            return None
+
+    def get_lmc_index(self):
+        '''
+        returns LMC halo inex based on Buch+24 criteria.
+
+        - V_circ,max > 55 km/s (if multiplicity, choose most massive)
+        - a_infall > 0.86
+        - distance to host at z=0 is 30 kpc < d < 70 kpc
+        '''
+
+        candidates = np.zeros(len(self.infall_properties["infall_snapshot"]), dtype=bool)
+        candidates[1:] = True # exclude host
+        
+        # intact at z=0
+        candidates &= self.rs[:, -1]['ok']
+        # infall selection
+        candidates &= (self.infall_properties["infall_snapshot"] >= 0) & \
+              (self.infall_properties["infall_snapshot"] < len(self.scale_factors))
+        candidates &= self.scale_factors[self.infall_properties["infall_snapshot"]] > 0.86
+        # distance selection at z=0
+        d = np.linalg.norm(self.rs[:, -1]['x'], axis=-1)
+        candidates &= (d > 30) & (d < 70)
+        # mass selection
+        candidates &= self.hist['vpeak'] > 55
+
+
+        if np.any(candidates):
+            lmc_index = np.where(candidates)[0][np.argmax(self.hist['vpeak'][candidates])]
+            return lmc_index
+        else:
+            return None
