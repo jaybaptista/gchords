@@ -671,4 +671,5 @@ class FiducialGCHaloModel(GCHaloModel):
             mass_model=GCSMassLinearModel(),
             gclf_model=GCMFVillegas(),
             nimbus_model=GC_HALO_MODEL,
+            mass_to_light_ratio_model=GChordsMassLightRatioModel()
         )
