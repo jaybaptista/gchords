@@ -1,11 +1,12 @@
 import abc
 import numpy as np
 from scipy.stats import uniform
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, LinearNDInterpolator
 from scipy.stats import lognorm
 import symlib
 from scipy.stats import norm
 from gchords.tag import GlobularClusterRhalf
+from gchords.mah import mean_mah
 
 """
 Mass-to-light ratios are taken from N-body modeling of globular clusters:
@@ -350,6 +351,109 @@ class GCSMassDornanModel(GCSMassModel):
             return 10**log_mgc
         else:
             return 10 ** (self.intercept + self.slope * np.log10(halo_mass))
+
+
+class GCSDornanMassInSitu(GCSMassModel):
+    def __init__(
+        self,
+        slope=0.9257,
+        intercept=-3.5645,
+        scatter=0.3,
+        masses=None,
+        z_eval=None,
+        seed=None,
+    ):
+        """
+        In-situ GCS mass model using the Dornan mass-halo relation evaluated along
+        each halo's mean MAH, then interpolated over (halo_mass, redshift).
+        """
+        super().__init__(seed=seed)
+        self.kind = "halo"
+        self.slope = slope
+        self.intercept = intercept
+        self.scatter = scatter
+
+        if masses is None:
+            masses = np.logspace(7, 14, 100)
+        if z_eval is None:
+            z_eval = np.linspace(0, 12, 100)
+
+        self._interp = self._build_interpolator(masses, z_eval)
+
+    def _build_interpolator(self, masses, z_eval):
+        dornan = GCSMassDornanModel(slope=self.slope, intercept=self.intercept, scatter=0.0)
+        log_mhalo_pts, a_pts, log_mgcs_vals = [], [], []
+
+        for mass in masses:
+            zs, m_track = mean_mah(mass, z_eval=z_eval)
+            log_mgcs = np.log10(dornan.mass(m_track[0]))
+            a = 1.0 / (1.0 + zs)
+            log_mhalo_pts.extend(np.log10(m_track))
+            a_pts.extend(a)
+            log_mgcs_vals.extend(np.full(len(zs), log_mgcs))
+
+        return LinearNDInterpolator(
+            np.column_stack([log_mhalo_pts, a_pts]),
+            np.array(log_mgcs_vals),
+        )
+
+    def var_names(self):
+        return ["slope", "intercept", "scatter"]
+
+    def mass(self, halo_mass, z=0.0):
+        halo_mass = np.atleast_1d(np.asarray(halo_mass, dtype=float))
+        a = np.full_like(halo_mass, 1.0 / (1.0 + z))
+        log_mgcs = self._interp(np.log10(halo_mass), a)
+
+        if self.scatter > 0:
+            log_mgcs += self.scatter * np.random.normal(0, 1, size=log_mgcs.shape)
+
+        return 10**log_mgcs
+
+
+class GCSDornanMixture(GCSMassModel):
+    def __init__(
+        self,
+        alpha=0.5,
+        slope=0.9257,
+        intercept=-3.5645,
+        scatter=0.3,
+        masses=None,
+        z_eval=None,
+        seed=None,
+    ):
+        """
+        Mixture of the Dornan in-situ and ex-situ GCS mass models.
+
+        log_mgcs = log_insitu * (log_exsitu / log_insitu) ** alpha
+
+        alpha=0 recovers the pure in-situ model; alpha=1 recovers the pure ex-situ model.
+        """
+        super().__init__(seed=seed)
+        self.kind = "halo"
+        self.alpha = alpha
+
+        self._insitu = GCSDornanMassInSitu(
+            slope=slope, intercept=intercept, scatter=0.0,
+            masses=masses, z_eval=z_eval, seed=seed,
+        )
+        self._exsitu = GCSMassDornanModel(slope=slope, intercept=intercept, scatter=0.0)
+        self.scatter = scatter
+
+    def var_names(self):
+        return ["alpha", "slope", "intercept", "scatter"]
+
+    def mass(self, halo_mass, z=0.0):
+        halo_mass = np.atleast_1d(np.asarray(halo_mass, dtype=float))
+
+        log_insitu = np.log10(self._insitu.mass(halo_mass, z=z))
+        log_exsitu = np.log10(self._exsitu.mass(halo_mass))
+        log_mgcs = log_insitu * (log_exsitu / log_insitu) ** self.alpha
+
+        if self.scatter > 0:
+            log_mgcs += self.scatter * np.random.normal(0, 1, size=log_mgcs.shape)
+
+        return 10**log_mgcs
 
 
 """
