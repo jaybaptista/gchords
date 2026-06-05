@@ -92,7 +92,7 @@ class SymphonyInterface(Interface):
         disrupt_index = []
 
         for subhalo in range(self.rs.shape[0]):
-            row = self.rs[subhalo, :]
+            row = self.rs[subhalo, :]['ok']
 
             transitions = False
             seen_true = False
