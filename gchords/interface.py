@@ -140,10 +140,15 @@ class SymphonyInterface(Interface):
         masked_masses = np.where(self.rs["ok"], self.rs["m"], 0.0)
         peak_snaps = np.argmax(masked_masses, axis=1)
         mpeaks = masked_masses[np.arange(len(peak_snaps)), peak_snaps]
+
+        # get host peak mass 
         mhost_at_peak = self.rs["m"][0, peak_snaps]
-        candidates &= (mpeaks / np.where(mhost_at_peak > 0, mhost_at_peak, np.inf)) > 0.2
+
+        # check peak mass ratio
+        candidates &= (mpeaks / mhost_at_peak) > 0.2
 
         if np.any(candidates):
+            # choose the most massive candidate if multiple
             gse_index = np.where(candidates)[0][np.argmax(self.infall_properties["halo_mass"][candidates])]
             return gse_index
         else:
