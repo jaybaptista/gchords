@@ -78,7 +78,7 @@ class SymphonyInterface(Interface):
 
         self.particles = symlib.Particles(self.sim_dir)
 
-    def disrupts(self):
+    def disrupts(self, max_snap=235):
         '''
         Returns a boolean array of length (N_subhalos) indicating if a subhalo 
         disrupts at some point, and the index of first False after the last True.
@@ -92,7 +92,7 @@ class SymphonyInterface(Interface):
         disrupt_index = []
 
         for subhalo in range(self.rs.shape[0]):
-            row = self.rs[subhalo, :]['ok']
+            row = self.rs[subhalo, :max_snap+1]['ok']
 
             transitions = False
             seen_true = False
