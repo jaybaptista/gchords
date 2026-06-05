@@ -1,4 +1,5 @@
 import abc
+import os
 import numpy as np
 from scipy.stats import uniform
 from scipy.interpolate import interp1d, LinearNDInterpolator
@@ -7,6 +8,8 @@ import symlib
 from scipy.stats import norm
 from gchords.tag import GlobularClusterRhalf
 from gchords.mah import mean_mah
+
+_ZFORM_TABLE_PATH = os.path.join(os.path.dirname(__file__), "data", "zform_pdf_table.csv")
 
 """
 Mass-to-light ratios are taken from N-body modeling of globular clusters:
@@ -420,6 +423,7 @@ class GCSDornanMixture(GCSMassModel):
         scatter=0.3,
         masses=None,
         z_eval=None,
+        z_form_weight=False,
         seed=None,
     ):
         """
@@ -428,10 +432,14 @@ class GCSDornanMixture(GCSMassModel):
         log_mgcs = log_insitu * (log_exsitu / log_insitu) ** alpha
 
         alpha=0 recovers the pure in-situ model; alpha=1 recovers the pure ex-situ model.
+
+        If z_form_weight=True, the GCS mass is further weighted by the fraction of GC
+        formation occurring after infall
         """
         super().__init__(seed=seed)
         self.kind = "halo"
         self.alpha = alpha
+        self.z_form_weight = z_form_weight
 
         self._insitu = GCSDornanMassInSitu(
             slope=slope, intercept=intercept, scatter=0.0,
@@ -440,8 +448,32 @@ class GCSDornanMixture(GCSMassModel):
         self._exsitu = GCSMassDornanModel(slope=slope, intercept=intercept, scatter=0.0)
         self.scatter = scatter
 
+        if z_form_weight:
+            self._sf = self._build_survival_function()
+
+    def _build_survival_function(self):
+        """
+        Load p(z_form) data table, normalize to unity, and return an interpolator for the survival function
+        """
+        table = np.genfromtxt(_ZFORM_TABLE_PATH, delimiter=",", skip_header=1)
+        z_grid = table[:, 0]
+        pdf    = table[:, 1]
+
+        # normalise so that the trapezoid integral over the full range equals 1
+        norm_factor = np.trapz(pdf, z_grid)
+        pdf = pdf / norm_factor
+
+        # survival function
+        cdf_vals = np.zeros_like(pdf)
+        for i in range(1, len(z_grid)):
+            cdf_vals[i] = np.trapz(pdf[:i+1], z_grid[:i+1])
+
+        sf_vals = 1.0 - cdf_vals
+
+        return interp1d(z_grid, sf_vals, bounds_error=False, fill_value=(1.0, 0.0))
+
     def var_names(self):
-        return ["alpha", "slope", "intercept", "scatter"]
+        return ["alpha", "slope", "intercept", "scatter", "z_form_weight"]
 
     def mass(self, halo_mass, z=0.0):
         halo_mass = np.atleast_1d(np.asarray(halo_mass, dtype=float))
@@ -452,6 +484,10 @@ class GCSDornanMixture(GCSMassModel):
 
         if self.scatter > 0:
             log_mgcs += self.scatter * np.random.normal(0, 1, size=log_mgcs.shape)
+
+        if self.z_form_weight:
+            weight = self._sf(z)           # scalar: S(z_infall)
+            log_mgcs += np.log10(weight)   # multiply M_gcs by the weight
 
         return 10**log_mgcs
 
@@ -671,5 +707,5 @@ class FiducialGCHaloModel(GCHaloModel):
             mass_model=GCSMassLinearModel(),
             gclf_model=GCMFVillegas(),
             nimbus_model=GC_HALO_MODEL,
-            mass_to_light_ratio_model=GChordsMassLightRatioModel()
+            mass_to_light_ratio_model=FlexibleMassLightRatioGCLF()
         )
