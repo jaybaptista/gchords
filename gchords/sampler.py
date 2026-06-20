@@ -50,7 +50,8 @@ class KruijssenAgeModel(AgeModel):
     """
 
     def __init__(self):
-        table = np.genfromtxt("data/zform_pdf_table.csv", delimiter=",", skip_header=1)
+        _data_path = os.path.join(os.path.dirname(__file__), "data", "zform_pdf_table.csv")
+        table = np.genfromtxt(_data_path, delimiter=",", skip_header=1)
         z_grid = table[:, 0]
         pdf    = table[:, 1]
 
