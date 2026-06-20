@@ -557,12 +557,6 @@ class GCSDornanMixture(GCSMassModel):
         log_insitu = np.log10(self._insitu.mass(halo_mass, z=z))
         log_exsitu = np.log10(self._exsitu.mass(halo_mass))
 
-        # fall back to ex-situ where the in-situ interpolator is out of range
-        # this is probably not what I want to do in the future
-        # but this is an OK fix for now
-        nan_mask = np.isnan(log_insitu)
-        log_insitu = np.where(nan_mask, log_exsitu, log_insitu)
-
         # M_0 * (M_inf / M_0)^alpha in log space
         log_mgcs = log_insitu + self.alpha * (log_exsitu - log_insitu)
 
