@@ -23,7 +23,7 @@ def dmdz_mean(z, m):
     return [a * rad * dtdz * 1e9]
 
 # Mean rates
-def mean_mah(m0, zmax=14, z_eval=None):
+def mean_mah(m0, zmax=20, z_eval=None):
     if z_eval is None:
         z_eval = np.linspace(0, zmax, 500)
 
@@ -47,7 +47,7 @@ def dmdz_median(z, m):
     dtdz = cosmo.age(z, derivative=1)
     return [a * rad * dtdz * 1e9]
 
-def median_mah(m0, zmax=14, z_eval=None):
+def median_mah(m0, zmax=20, z_eval=None):
     if z_eval is None:
         z_eval = np.linspace(0, zmax, 500)
 

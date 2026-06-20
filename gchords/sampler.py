@@ -470,9 +470,9 @@ class GCSDornanMassInSitu(GCSMassModel):
         self.scatter = scatter
 
         if masses is None:
-            masses = np.logspace(7, 14, 100)
+            masses = np.logspace(7, 14, 500)
         if z_eval is None:
-            z_eval = np.linspace(0, 12, 100)
+            z_eval = np.linspace(0, 20, 500)
 
         self._interp = self._build_interpolator(masses, z_eval)
 
