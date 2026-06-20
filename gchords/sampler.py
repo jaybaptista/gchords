@@ -9,7 +9,80 @@ from scipy.stats import norm
 from gchords.tag import GlobularClusterRhalf
 from gchords.mah import mean_mah
 
-_ZFORM_TABLE_PATH = os.path.join(os.path.dirname(__file__), "data", "zform_pdf_table.csv")
+
+class AgeModel(abc.ABC):
+    """
+    Base class for GC formation-redshift (age) distributions.
+
+    Subclasses supply a p(z_form) distribution which can be queried as a PDF
+    over redshift or as a PDF over lookback time / age.
+    """
+
+    @abc.abstractmethod
+    def p_zform(self, z):
+        """Probability density p(z_form) evaluated at redshift z."""
+        pass
+
+    @abc.abstractmethod
+    def p_age(self, age):
+        """Probability density p(age) evaluated at lookback time `age` (Gyr)."""
+        pass
+
+    def survival(self, z):
+        """
+        Fraction of GC formation occurring at z_form > z:
+            S(z) = integral_z^{inf} p(z_form) dz_form
+
+        Default implementation integrates p_zform numerically.
+        Subclasses may override for analytic efficiency.
+        """
+        z_grid = np.linspace(z, self._z_max(), 2000)
+        return np.trapz(self.p_zform(z_grid), z_grid)
+
+    def _z_max(self):
+        return 20.0
+
+
+class KruijssenAgeModel(AgeModel):
+    """
+    p(z_form) based on the mean age distribution in Kruijssen (2019)
+
+    """
+
+    def __init__(self):
+        table = np.genfromtxt("data/zform_pdf_table.csv", delimiter=",", skip_header=1)
+        z_grid = table[:, 0]
+        pdf    = table[:, 1]
+
+        norm_factor = np.trapz(pdf, z_grid)
+        self._pdf_norm = pdf / norm_factor
+        self._z_grid   = z_grid
+
+        self._pdf_interp = interp1d(
+            z_grid, self._pdf_norm,
+            bounds_error=False, fill_value=0.0,
+        )
+
+        # precomputed survival function
+        cdf_vals = np.zeros_like(self._pdf_norm)
+        for i in range(1, len(z_grid)):
+            cdf_vals[i] = np.trapz(self._pdf_norm[:i+1], z_grid[:i+1])
+        self._sf_interp = interp1d(
+            z_grid, 1.0 - cdf_vals,
+            bounds_error=False, fill_value=(1.0, 0.0),
+        )
+
+    def p_zform(self, z):
+        return self._pdf_interp(z)
+
+    def p_age(self, age):
+        raise NotImplementedError("Convert age→z with a cosmology before calling p_zform.")
+
+    def survival(self, z):
+        return float(self._sf_interp(z))
+
+    def _z_max(self):
+        return float(self._z_grid[-1])
 
 """
 Mass-to-light ratios are taken from N-body modeling of globular clusters:
@@ -272,6 +345,25 @@ class DornanOccupationModel(OccupationModel):
         return uniform.rvs() < p
 
 
+class DornanMstarOccupationModel(OccupationModel):
+    def __init__(self, b0=-0.29, b1=1.38, seed=None):
+        super().__init__(seed=seed)
+        self.kind = "stellar"
+        self.b0 = b0
+        self.b1 = b1
+
+    def var_names(self):
+        return ["b0", "b1"]
+
+    def p_gc(self, stellar_mass):
+        p = 1 / (1 + np.exp(-(self.b0 + self.b1 * np.log10(stellar_mass))))
+        return p
+
+    def has_gc(self, stellar_mass):
+        p = self.p_gc(stellar_mass)
+        return uniform.rvs() < p
+
+
 """
 GC system mass models
 """
@@ -424,6 +516,7 @@ class GCSDornanMixture(GCSMassModel):
         masses=None,
         z_eval=None,
         z_form_weight=False,
+        age_model=None,
         seed=None,
     ):
         """
@@ -433,13 +526,19 @@ class GCSDornanMixture(GCSMassModel):
 
         alpha=0 recovers the pure in-situ model; alpha=1 recovers the pure ex-situ model.
 
-        If z_form_weight=True, the GCS mass is further weighted by the fraction of GC
-        formation occurring after infall
+        If z_form_weight=True, the GCS mass is weighted by the fraction of GC formation
+        occurring after infall:
+
+            M_gcs_weighted = M_gcs(M_peak, z_infall) * S(z_infall)
+
+        where S(z) = integral_z^{inf} p(z_form) dz_form comes from `age_model`
+        (defaults to KruijssenAgeModel).
         """
         super().__init__(seed=seed)
         self.kind = "halo"
         self.alpha = alpha
         self.z_form_weight = z_form_weight
+        self.age_model = age_model if age_model is not None else KruijssenAgeModel()
 
         self._insitu = GCSDornanMassInSitu(
             slope=slope, intercept=intercept, scatter=0.0,
@@ -447,30 +546,6 @@ class GCSDornanMixture(GCSMassModel):
         )
         self._exsitu = GCSMassDornanModel(slope=slope, intercept=intercept, scatter=0.0)
         self.scatter = scatter
-
-        if z_form_weight:
-            self._sf = self._build_survival_function()
-
-    def _build_survival_function(self):
-        """
-        Load p(z_form) data table, normalize to unity, and return an interpolator for the survival function
-        """
-        table = np.genfromtxt(_ZFORM_TABLE_PATH, delimiter=",", skip_header=1)
-        z_grid = table[:, 0]
-        pdf    = table[:, 1]
-
-        # normalise so that the trapezoid integral over the full range equals 1
-        norm_factor = np.trapz(pdf, z_grid)
-        pdf = pdf / norm_factor
-
-        # survival function
-        cdf_vals = np.zeros_like(pdf)
-        for i in range(1, len(z_grid)):
-            cdf_vals[i] = np.trapz(pdf[:i+1], z_grid[:i+1])
-
-        sf_vals = 1.0 - cdf_vals
-
-        return interp1d(z_grid, sf_vals, bounds_error=False, fill_value=(1.0, 0.0))
 
     def var_names(self):
         return ["alpha", "slope", "intercept", "scatter", "z_form_weight"]
@@ -480,14 +555,22 @@ class GCSDornanMixture(GCSMassModel):
 
         log_insitu = np.log10(self._insitu.mass(halo_mass, z=z))
         log_exsitu = np.log10(self._exsitu.mass(halo_mass))
-        log_mgcs = log_insitu * (log_exsitu / log_insitu) ** self.alpha
+
+        # fall back to ex-situ where the in-situ interpolator is out of range
+        # this is probably not what I want to do in the future
+        # but this is an OK fix for now
+        nan_mask = np.isnan(log_insitu)
+        log_insitu = np.where(nan_mask, log_exsitu, log_insitu)
+
+        # M_0 * (M_inf / M_0)^alpha in log space
+        log_mgcs = log_insitu + self.alpha * (log_exsitu - log_insitu)
 
         if self.scatter > 0:
             log_mgcs += self.scatter * np.random.normal(0, 1, size=log_mgcs.shape)
 
         if self.z_form_weight:
-            weight = self._sf(z)           # scalar: S(z_infall)
-            log_mgcs += np.log10(weight)   # multiply M_gcs by the weight
+            weight = self.age_model.survival(z)
+            log_mgcs += np.log10(weight)
 
         return 10**log_mgcs
 
