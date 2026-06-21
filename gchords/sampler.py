@@ -3,6 +3,13 @@ import os
 import numpy as np
 from scipy.stats import uniform
 from scipy.interpolate import interp1d, LinearNDInterpolator
+
+# sometimes I have to use older versions of numpy that don't have np.trapezoid, so I import it from scipy...
+try:
+    from scipy.integrate import trapezoid as _trapezoid
+except ImportError:
+    from scipy.integrate import trapz as _trapezoid
+
 from scipy.stats import lognorm
 import symlib
 from scipy.stats import norm
