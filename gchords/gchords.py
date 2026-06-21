@@ -3,10 +3,13 @@ import pandas as pd
 import symlib
 from tqdm import tqdm
 from scipy.interpolate import UnivariateSpline, PchipInterpolator
+from gchords.sampler import ValcinAgeModel
+
 class GChords(object):
-    def __init__(self, interface, gc_halo_model, **kwargs):
+    def __init__(self, interface, gc_halo_model, age_model=None, **kwargs):
         self.interface = interface
         self.gc_halo_model = gc_halo_model
+        self.age_model = age_model if age_model is not None else ValcinAgeModel()
         self.particle_tags = None
         # particle tagging with Nimbus
         self.weights, _, _ = symlib.tag_stars(
@@ -116,6 +119,7 @@ class GChords(object):
     
 
     def track_clusters(self, comoving=False, write_dir='particles.npz'):
+        # TODO: add capability to track from a_form snapshot.
         if self.particle_tags is None:
             raise ValueError("No particle tags found. Run generate_clusters() first.")
         

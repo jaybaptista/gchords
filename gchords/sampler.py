@@ -14,7 +14,7 @@ from scipy.stats import lognorm
 import symlib
 from scipy.stats import norm
 from gchords.tag import GlobularClusterRhalf
-from gchords.mah import mean_mah
+from gchords.mah import mean_mah, cosmo
 
 
 class AgeModel(abc.ABC):
@@ -91,6 +91,52 @@ class KruijssenAgeModel(AgeModel):
 
     def _z_max(self):
         return float(self._z_grid[-1])
+
+
+class ValcinAgeModel(AgeModel):
+    """
+    p(z_form) derived from ages computed from Valcin+2025 with a hard cut at zmax = 20
+    ages are computed to z_form using the cosmology specified in mah.py
+    (source: https://arxiv.org/abs/2503.19481)
+    """
+
+    def __init__(self, mu=11.89, sigma=0.98, z_max=20.0, n_grid=2000):
+        self._mu = mu
+        self._sigma = sigma
+        self._zmax = z_max
+
+        z_grid = np.linspace(0.0, z_max, n_grid)
+        t0 = cosmo.age(0)
+        t_grid = np.array([t0 - cosmo.age(z) for z in z_grid])
+
+        dtdz = np.abs(np.gradient(t_grid, z_grid))
+        p_z_raw = norm.pdf(t_grid, loc=mu, scale=sigma) * dtdz
+
+        norm_factor = _trapezoid(p_z_raw, z_grid)
+        p_z_norm = p_z_raw / norm_factor
+
+        self._pdf_interp = interp1d(z_grid, p_z_norm, bounds_error=False, fill_value=0.0)
+
+        cdf_vals = np.zeros_like(p_z_norm)
+        for i in range(1, len(z_grid)):
+            cdf_vals[i] = _trapezoid(p_z_norm[:i+1], z_grid[:i+1])
+        self._sf_interp = interp1d(
+            z_grid, 1.0 - cdf_vals, bounds_error=False, fill_value=(1.0, 0.0)
+        )
+        self._z_grid = z_grid
+
+    def p_zform(self, z):
+        return self._pdf_interp(z)
+
+    def p_age(self, age):
+        return norm.pdf(age, loc=self._mu, scale=self._sigma)
+
+    def survival(self, z):
+        return float(self._sf_interp(z))
+
+    def _z_max(self):
+        return self._zmax
+
 
 """
 Mass-to-light ratios are taken from N-body modeling of globular clusters:
@@ -540,13 +586,13 @@ class GCSDornanMixture(GCSMassModel):
             M_gcs_weighted = M_gcs(M_peak, z_infall) * S(z_infall)
 
         where S(z) = integral_z^{inf} p(z_form) dz_form comes from `age_model`
-        (defaults to KruijssenAgeModel).
+        (defaults to ValcinAgeModel).
         """
         super().__init__(seed=seed)
         self.kind = "halo"
         self.alpha = alpha
         self.z_form_weight = z_form_weight
-        self.age_model = age_model if age_model is not None else KruijssenAgeModel()
+        self.age_model = age_model if age_model is not None else ValcinAgeModel()
 
         self._insitu = GCSDornanMassInSitu(
             slope=slope, intercept=intercept, scatter=0.0,

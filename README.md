@@ -15,6 +15,9 @@ The (main) classes that generate the GC population are:
     - `GCLuminosityFunction`: what is the luminosity distribution of the GC systems?
 
 There are additional classes that facilitate the evolution of the GC systems:
+- `AgeModel`: a class that defines the GC formation-redshift distribution p(z_form). Available models:
+    - `ValcinAgeModel` (default): Gaussian in lookback time (μ=11.89 Gyr, σ=0.98 Gyr) transformed to redshift space via the mah.py cosmology, with a hard cut at z=20. Based on [Valcin et al. 2025](https://arxiv.org/abs/2503.19481).
+    - `KruijssenAgeModel`: tabulated p(z_form) from [Kruijssen et al. 2019](https://ui.adsabs.harvard.edu/abs/2019MNRAS.486.3180K).
 - `Potential`: a class that uses the particle tracking data in the `Interface` to produce a time-evolving potential and evaluate tidal fields.
 - `MassLossModel`: a class that defines how a cluster loses mass.
 
