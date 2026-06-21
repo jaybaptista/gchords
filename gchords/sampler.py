@@ -37,7 +37,7 @@ class AgeModel(abc.ABC):
         Subclasses may override for analytic efficiency.
         """
         z_grid = np.linspace(z, self._z_max(), 2000)
-        return np.trapz(self.p_zform(z_grid), z_grid)
+        return np.trapezoid(self.p_zform(z_grid), z_grid)
 
     def _z_max(self):
         return 20.0
@@ -55,7 +55,7 @@ class KruijssenAgeModel(AgeModel):
         z_grid = table[:, 0]
         pdf    = table[:, 1]
 
-        norm_factor = np.trapz(pdf, z_grid)
+        norm_factor = np.trapezoid(pdf, z_grid)
         self._pdf_norm = pdf / norm_factor
         self._z_grid   = z_grid
 
@@ -67,7 +67,7 @@ class KruijssenAgeModel(AgeModel):
         # precomputed survival function
         cdf_vals = np.zeros_like(self._pdf_norm)
         for i in range(1, len(z_grid)):
-            cdf_vals[i] = np.trapz(self._pdf_norm[:i+1], z_grid[:i+1])
+            cdf_vals[i] = np.trapezoid(self._pdf_norm[:i+1], z_grid[:i+1])
         self._sf_interp = interp1d(
             z_grid, 1.0 - cdf_vals,
             bounds_error=False, fill_value=(1.0, 0.0),
@@ -470,9 +470,9 @@ class GCSDornanMassInSitu(GCSMassModel):
         self.scatter = scatter
 
         if masses is None:
-            masses = np.logspace(7, 14, 500)
+            masses = np.logspace(7, 14, 50)
         if z_eval is None:
-            z_eval = np.linspace(0, 20, 500)
+            z_eval = np.linspace(0, 20, 100)
 
         self._interp = self._build_interpolator(masses, z_eval)
 
