@@ -100,12 +100,12 @@ class ValcinAgeModel(AgeModel):
     (source: https://arxiv.org/abs/2503.19481)
     """
 
-    def __init__(self, mu=11.89, sigma=0.98, z_max=20.0, n_grid=2000):
+    def __init__(self, mu=11.89, sigma=0.98, zmax=20, n_grid=2000):
         self._mu = mu
         self._sigma = sigma
-        self._zmax = z_max
+        self._zmax = zmax
 
-        z_grid = np.linspace(0.0, z_max, n_grid)
+        z_grid = np.linspace(0.0, zmax, n_grid)
         t0 = cosmo.age(0)
         t_grid = np.array([t0 - cosmo.age(z) for z in z_grid])
 
