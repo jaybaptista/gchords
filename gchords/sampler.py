@@ -12,7 +12,7 @@ except ImportError:
 
 from scipy.stats import lognorm
 import symlib
-from scipy.stats import norm
+from scipy.stats import norm, truncnorm
 from gchords.tag import GlobularClusterRhalf
 from gchords.mah import mean_mah, cosmo
 
@@ -230,6 +230,12 @@ class MassLightRatioModel(abc.ABC):
         pass
 
 
+def sample_truncated_normal(loc, scale, xmin=-np.inf, xmax=np.inf):
+    a = (xmin - loc) / scale
+    b = (xmax - loc) / scale
+    return truncnorm.rvs(a, b, loc=loc, scale=scale)
+
+
 def _lognormal_icdf(logmu, sigma):
     return lognorm(s=sigma * np.log(10), scale=10**logmu).ppf
 
@@ -324,7 +330,7 @@ class FlexibleMassLightRatioGCLF(GCLuminosityFunction):
     def set_sampler(self):
         # sample the GCMF parameter random variables
         self.mass_mu = np.random.normal(loc=self.gcmf_mean_mu, scale=self.gcmf_mean_scale)
-        self.mass_sigma = abs(np.random.normal(loc=self.gcmf_std_mu, scale=self.gcmf_std_scale))
+        self.mass_sigma = sample_truncated_normal(self.gcmf_std_mu, self.gcmf_std_scale, xmin=0.0)
 
         # sample GC masses from the lognormal GCMF
         self.icdf = _lognormal_icdf(self.mass_mu, self.mass_sigma)
