@@ -88,7 +88,7 @@ class KruijssenAgeModel(AgeModel):
         return self._pdf_interp(t)
 
     def survival(self, t):
-        return float(self._sf_interp(t))
+        return self._sf_interp(t)
 
 
 class ValcinAgeModel(AgeModel):
@@ -128,7 +128,7 @@ class ValcinAgeModel(AgeModel):
         return norm.pdf(age, loc=self._mu, scale=self._sigma)
 
     def survival(self, t):
-        return float(self._sf_interp(np.clip(t, 0, self._tmax)))
+        return self._sf_interp(np.clip(t, 0, self._tmax))
 
 
 """
