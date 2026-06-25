@@ -19,125 +19,116 @@ from gchords.mah import mean_mah, cosmo
 
 class AgeModel(abc.ABC):
     """
-    Base class for GC formation-redshift (age) distributions.
+    Base class for GC formation-time distributions.
 
-    Subclasses supply a p(z_form) distribution which can be queried as a PDF
-    over redshift or as a PDF over lookback time / age.
+    Subclasses supply a p(t) distribution in cosmic time (Gyr since Big Bang).
     """
 
     @abc.abstractmethod
-    def p_zform(self, z):
-        """Probability density p(z_form) evaluated at redshift z."""
+    def p_time(self, t):
+        """Probability density p(t_form) evaluated at cosmic time t (Gyr)."""
         pass
 
-    @abc.abstractmethod
     def p_age(self, age):
-        """Probability density p(age) evaluated at lookback time `age` (Gyr)."""
-        pass
+        """Probability density p(age) evaluated at lookback time age (Gyr)."""
+        raise NotImplementedError
 
-    def survival(self, z):
+    def survival(self, t):
         """
-        Fraction of GC formation occurring at z_form > z:
-            S(z) = integral_z^{inf} p(z_form) dz_form
+        Fraction of GC formation occurring before cosmic time t:
+            S(t) = integral_0^t p(t') dt'
 
-        Default implementation integrates p_zform numerically.
+        Default implementation integrates p_time numerically.
         Subclasses may override for analytic efficiency.
         """
-        z_grid = np.linspace(z, self._z_max(), 2000)
-        return _trapezoid(self.p_zform(z_grid), z_grid)
-
-    def _z_max(self):
-        return 20.0
+        t_grid = np.linspace(0, t, 2000)
+        return _trapezoid(self.p_time(t_grid), t_grid)
 
 
 class KruijssenAgeModel(AgeModel):
     """
-    p(z_form) based on the mean age distribution in Kruijssen (2019)
-
+    p(t_form) based on the mean age distribution in Kruijssen (2019),
+    converted from the z-space KDE table to cosmic time via the mah.py cosmology.
     """
 
     def __init__(self):
         _data_path = os.path.join(os.path.dirname(__file__), "data", "zform_pdf_table.csv")
         table = np.genfromtxt(_data_path, delimiter=",", skip_header=1)
         z_grid = table[:, 0]
-        pdf    = table[:, 1]
+        pdf_z  = table[:, 1]
 
-        norm_factor = _trapezoid(pdf, z_grid)
-        self._pdf_norm = pdf / norm_factor
-        self._z_grid   = z_grid
+        # convert z → cosmic time; z increases → t decreases, so reverse
+        t_grid = np.array([cosmo.age(z) for z in z_grid])
+        dtdz   = np.abs(np.gradient(t_grid, z_grid))   # |dt/dz|
+
+        # change of variables: p(t) = p(z) / |dt/dz|
+        pdf_t  = pdf_z / dtdz
+        t_grid = t_grid[::-1]
+        pdf_t  = pdf_t[::-1]
+
+        norm_factor    = _trapezoid(pdf_t, t_grid)
+        self._pdf_norm = pdf_t / norm_factor
+        self._t_grid   = t_grid
 
         self._pdf_interp = interp1d(
-            z_grid, self._pdf_norm,
+            t_grid, self._pdf_norm,
             bounds_error=False, fill_value=0.0,
         )
 
-        # precomputed survival function
+        # precomputed CDF: S(t) = fraction of GCs formed before time t
         cdf_vals = np.zeros_like(self._pdf_norm)
-        for i in range(1, len(z_grid)):
-            cdf_vals[i] = _trapezoid(self._pdf_norm[:i+1], z_grid[:i+1])
+        for i in range(1, len(t_grid)):
+            cdf_vals[i] = _trapezoid(self._pdf_norm[:i+1], t_grid[:i+1])
         self._sf_interp = interp1d(
-            z_grid, 1.0 - cdf_vals,
-            bounds_error=False, fill_value=(1.0, 0.0),
+            t_grid, cdf_vals,
+            bounds_error=False, fill_value=(0.0, 1.0),
         )
 
-    def p_zform(self, z):
-        return self._pdf_interp(z)
+    def p_time(self, t):
+        return self._pdf_interp(t)
 
-    def p_age(self, age):
-        raise NotImplementedError("Convert age→z with a cosmology before calling p_zform.")
-
-    def survival(self, z):
-        return float(self._sf_interp(z))
-
-    def _z_max(self):
-        return float(self._z_grid[-1])
+    def survival(self, t):
+        return float(self._sf_interp(t))
 
 
 class ValcinAgeModel(AgeModel):
     """
-    p(z_form) derived from ages computed from Valcin+2025 with a hard cut at zmax = 20
-    ages are computed to z_form using the cosmology specified in mah.py
+    p(t_form) derived from ages in Valcin+2025, parameterized as a Gaussian
+    in cosmic time with t_max = 13.8 Gyr.
     (source: https://arxiv.org/abs/2503.19481)
     """
 
-    def __init__(self, mu=11.89, sigma=0.98, zmin=0, zmax=20, n_grid=2000):
-        self._mu = mu
+    def __init__(self, mu=11.89, sigma=0.98, t_max=13.8, n_grid=2000):
+        self._mu    = mu      # peak in lookback time (Gyr)
         self._sigma = sigma
-        self._zmin = zmin
-        self._zmax = zmax
+        self._tmax  = t_max
 
-        z_grid = np.linspace(zmin, zmax, n_grid)
-        t0 = cosmo.age(0)
-        t_grid = np.array([t0 - cosmo.age(z) for z in z_grid])
+        t_grid = np.linspace(0, t_max, n_grid)
 
-        dtdz = np.abs(np.gradient(t_grid, z_grid))
-        p_z_raw = norm.pdf(t_grid, loc=mu, scale=sigma) * dtdz
+        # Gaussian in lookback time → peak at cosmic time t0 - mu
+        p_t_raw = norm.pdf(t_grid, loc=t_max - mu, scale=sigma)
 
-        norm_factor = _trapezoid(p_z_raw, z_grid)
-        p_z_norm = p_z_raw / norm_factor
+        norm_factor  = _trapezoid(p_t_raw, t_grid)
+        p_t_norm     = p_t_raw / norm_factor
 
-        self._pdf_interp = interp1d(z_grid, p_z_norm, bounds_error=False, fill_value=0.0)
+        self._pdf_interp = interp1d(t_grid, p_t_norm, bounds_error=False, fill_value=0.0)
 
-        cdf_vals = np.zeros_like(p_z_norm)
-        for i in range(1, len(z_grid)):
-            cdf_vals[i] = _trapezoid(p_z_norm[:i+1], z_grid[:i+1])
-        sf_vals = 1.0 - cdf_vals
+        cdf_vals = np.zeros_like(p_t_norm)
+        for i in range(1, len(t_grid)):
+            cdf_vals[i] = _trapezoid(p_t_norm[:i+1], t_grid[:i+1])
         self._sf_interp = interp1d(
-            z_grid, sf_vals, bounds_error=False, fill_value=(sf_vals[0], 0.0)
+            t_grid, cdf_vals, bounds_error=False, fill_value=(0.0, 1.0)
         )
-        self._z_grid = z_grid
+        self._t_grid = t_grid
 
-    def p_zform(self, z):
-        return self._pdf_interp(z)
+    def p_time(self, t):
+        return self._pdf_interp(np.clip(t, 0, self._tmax))
 
     def p_age(self, age):
         return norm.pdf(age, loc=self._mu, scale=self._sigma)
 
-    def survival(self, z):
-        return float(self._sf_interp(z))
-
-    def _z_max(self):
-        return self._zmax
+    def survival(self, t):
+        return float(self._sf_interp(np.clip(t, 0, self._tmax)))
 
 
 """
@@ -533,28 +524,30 @@ class GCSDornanMassInSitu(GCSMassModel):
 
     def _build_interpolator(self, masses, z_eval):
         dornan = GCSMassDornanModel(slope=self.slope, intercept=self.intercept, scatter=0.0)
-        log_mhalo_pts, a_pts, log_mgcs_vals = [], [], []
+        log_mhalo_pts, t_pts, log_mgcs_vals = [], [], []
 
         for mass in masses:
             zs, m_track = mean_mah(mass, z_eval=z_eval)
             log_mgcs = np.log10(dornan.mass(m_track[0]))
-            a = 1.0 / (1.0 + zs)
+            t = np.array([cosmo.age(z) for z in zs])
             log_mhalo_pts.extend(np.log10(m_track))
-            a_pts.extend(a)
+            t_pts.extend(t)
             log_mgcs_vals.extend(np.full(len(zs), log_mgcs))
 
         return LinearNDInterpolator(
-            np.column_stack([log_mhalo_pts, a_pts]),
+            np.column_stack([log_mhalo_pts, t_pts]),
             np.array(log_mgcs_vals),
         )
 
     def var_names(self):
         return ["slope", "intercept", "scatter"]
 
-    def mass(self, halo_mass, z=0.0):
+    def mass(self, halo_mass, z=0.0, cosmology=None):
+        if cosmology is None:
+            cosmology = cosmo
         halo_mass = np.atleast_1d(np.asarray(halo_mass, dtype=float))
-        a = np.full_like(halo_mass, 1.0 / (1.0 + z))
-        log_mgcs = self._interp(np.log10(halo_mass), a)
+        t = np.full_like(halo_mass, cosmology.age(z))
+        log_mgcs = self._interp(np.log10(halo_mass), t)
 
         if self.scatter > 0:
             log_mgcs += self.scatter * np.random.normal(0, 1, size=log_mgcs.shape)
@@ -606,10 +599,13 @@ class GCSDornanMixture(GCSMassModel):
     def var_names(self):
         return ["alpha", "slope", "intercept", "scatter", "z_form_weight"]
 
-    def mass(self, halo_mass, z=0.0):
+    def mass(self, halo_mass, z=0.0, cosmology=None):
+        if cosmology is None:
+            cosmology = cosmo
         halo_mass = np.atleast_1d(np.asarray(halo_mass, dtype=float))
+        t = cosmology.age(z)
 
-        log_insitu = np.log10(self._insitu.mass(halo_mass, z=z))
+        log_insitu = np.log10(self._insitu.mass(halo_mass, z=z, cosmology=cosmology))
         log_exsitu = np.log10(self._exsitu.mass(halo_mass))
 
         # M_0 * (M_inf / M_0)^alpha in log space
@@ -619,7 +615,7 @@ class GCSDornanMixture(GCSMassModel):
             log_mgcs += self.scatter * np.random.normal(0, 1, size=log_mgcs.shape)
 
         if self.z_form_weight:
-            weight = self.age_model.survival(z)
+            weight = self.age_model.survival(t)
             log_mgcs += np.log10(weight)
 
         return 10**log_mgcs
@@ -707,15 +703,13 @@ class GCMFVillegas(GaussianGCLF):
         self.mean_mass = mean_mass
         self.icdf = _lognormal_icdf(log_M_star, sigma_logM)
 
-class BaumgardtMassLightRatioModel(MassLightRatioModel):
-    '''
-    '''
+class GChordsMassLightRatioModel(MassLightRatioModel):
     def __init__(self):
-        self.mu1 = 0.62
-        self.sigma1 = 0.2
-        self.mu2 = 0.69
-        self.sigma2 = 0.88
-        self.w = 0.91
+        self.mu1    = 0.612
+        self.mu2    = 0.67
+        self.sigma1 = 0.173
+        self.sigma2 = 0.586
+        self.w      = 0.864
 
     def pdf(self, y):
         p1 = self.w * norm.pdf(y, loc=self.mu1, scale=self.sigma1)
@@ -723,30 +717,15 @@ class BaumgardtMassLightRatioModel(MassLightRatioModel):
         return p1 + p2
 
     def sample(self, n_draws=1):
-
-        # first choose which Gaussian to sample from
-        component = np.random.choice([0, 1], size=n_draws)
-        
-        # then sample from that Gaussian
-        samples = np.where(
+        component = np.random.choice([0, 1], size=n_draws, p=[self.w, 1 - self.w])
+        return np.where(
             component == 0,
             np.random.normal(self.mu1, self.sigma1, size=n_draws),
-            np.random.normal(self.mu2, self.sigma2, size=n_draws)
+            np.random.normal(self.mu2, self.sigma2, size=n_draws),
         )
 
-        return samples  
-    
     def var_names(self):
-        return super().var_names()
-
-class GChordsMassLightRatioModel(BaumgardtMassLightRatioModel):
-    
-    def __init__(self):
-        self.mu1 = 0.612
-        self.mu2 = 0.67
-        self.sigma1 = 0.173
-        self.sigma2 = 0.586
-        self.w = 0.864
+        return ["mu1", "mu2", "sigma1", "sigma2", "w"]
 
 class GCHaloModel:
     def __init__(self,
