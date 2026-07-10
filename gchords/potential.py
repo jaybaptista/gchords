@@ -51,15 +51,15 @@ class AgamaPotential(Potential):
 
         derivatives = np.array([self.phi.eval(x_i, der=True, t=t_i) for x_i, t_i in zip(x, t)])
 
-        d2phidx2 = derivatives[:, 0]
-        d2phidy2 = derivatives[:, 1]
-        d2phidz2 = derivatives[:, 2]
+        d2phidx2  = derivatives[:, 0]
+        d2phidy2  = derivatives[:, 1]
+        d2phidz2  = derivatives[:, 2]
         d2phidxdy = derivatives[:, 3]
-        d2phidxdz = derivatives[:, 4]
-        d2phidydz = derivatives[:, 5]
+        d2phidydz = derivatives[:, 4]
+        d2phidxdz = derivatives[:, 5]
         tidal_tensors = np.array([
-            [d2phidx2, d2phidxdy, d2phidxdz],
-            [d2phidxdy, d2phidy2, d2phidydz],
+            [d2phidx2,  d2phidxdy, d2phidxdz],
+            [d2phidxdy, d2phidy2,  d2phidydz],
             [d2phidxdz, d2phidydz, d2phidz2]
         ])
         tidal_tensors = np.moveaxis(tidal_tensors, -1, 0)
@@ -132,7 +132,18 @@ class SymphonyPotential(AgamaPotential):
         self.phi = agama.Potential(file=os.path.join(self.write_dir, 'potential.ini'))
         self.potential_exists = True
 
-    
+    def construct_potential_subhalo(self, halo_index, lmax, rmin=1e-2, rmax_rvir=1.2, nrad=25, mode='all', min_particles=100, symmetry='None', stride=1, overwrite=False):
+        os.makedirs(self.write_dir, exist_ok=True)
+
+        # check if it does exist 
+        subhalo_potential_exists = False
+
+        if subhalo_potential_exists and not overwrite:
+            print("Potential already exists. Use `overwrite=True` to reconstruct potential.")
+            return 
+        
+        
+            
 
 def is_bound(q, p, subhalo_pos, subhalo_vel, params):
     dq = q - subhalo_pos
