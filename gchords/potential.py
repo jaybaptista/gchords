@@ -49,20 +49,22 @@ class AgamaPotential(Potential):
         elif len(t) != N:
             raise ValueError("Length of time array must match number of positions.")
 
-        derivatives = np.array([self.phi.eval(x_i, der=True, t=t_i) for x_i, t_i in zip(x, t)])
+        d = np.array([self.phi.eval(x_i, der=True, t=t_i) for x_i, t_i in zip(x, t)])
 
-        d2phidx2  = derivatives[:, 0]
-        d2phidy2  = derivatives[:, 1]
-        d2phidz2  = derivatives[:, 2]
-        d2phidxdy = derivatives[:, 3]
-        d2phidydz = derivatives[:, 4]
-        d2phidxdz = derivatives[:, 5]
+        d2phidx2  = d[:, 0]
+        d2phidy2  = d[:, 1]
+        d2phidz2  = d[:, 2]
+        d2phidxdy = d[:, 3]
+        d2phidydz = d[:, 4]
+        d2phidxdz = d[:, 5]
         tidal_tensors = np.array([
             [d2phidx2,  d2phidxdy, d2phidxdz],
             [d2phidxdy, d2phidy2,  d2phidydz],
             [d2phidxdz, d2phidydz, d2phidz2]
         ])
+
         tidal_tensors = np.moveaxis(tidal_tensors, -1, 0)
+        
         return tidal_tensors[0] if tidal_tensors.shape[0] == 1 else tidal_tensors
     
     def tidal_strength(self, x, t=0.0):
