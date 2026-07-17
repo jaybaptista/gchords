@@ -33,7 +33,7 @@ class AgeModel(abc.ABC):
         """Probability density p(age) evaluated at lookback time age (Gyr)."""
         raise NotImplementedError
 
-    def survival(self, t):
+    def cdf(self, t):
         """
         Fraction of GC formation occurring before cosmic time t:
             S(t) = integral_0^t p(t') dt'
@@ -87,48 +87,35 @@ class KruijssenAgeModel(AgeModel):
     def p_time(self, t):
         return self._pdf_interp(t)
 
-    def survival(self, t):
+    def cdf(self, t):
         return self._sf_interp(t)
 
 
 class ValcinAgeModel(AgeModel):
     """
     p(t_form) derived from ages in Valcin+2025, parameterized as a Gaussian
-    in cosmic time with t_max = 13.8 Gyr.
+    in cosmic time truncated to [0, t_max].
     (source: https://arxiv.org/abs/2503.19481)
     """
 
-    def __init__(self, mu=11.89, sigma=0.98, t_max=13.8, n_grid=2000):
-        self._mu    = mu      # peak in lookback time (Gyr)
+    def __init__(self, mu=11.89, sigma=0.98, t_max=13.8):
+        self._mu = mu
         self._sigma = sigma
-        self._tmax  = t_max
+        self._tmax = t_max
 
-        t_grid = np.linspace(0, t_max, n_grid)
-
-        # Gaussian in lookback time → peak at cosmic time t0 - mu
-        p_t_raw = norm.pdf(t_grid, loc=t_max - mu, scale=sigma)
-
-        norm_factor  = _trapezoid(p_t_raw, t_grid)
-        p_t_norm     = p_t_raw / norm_factor
-
-        self._pdf_interp = interp1d(t_grid, p_t_norm, bounds_error=False, fill_value=0.0)
-
-        cdf_vals = np.zeros_like(p_t_norm)
-        for i in range(1, len(t_grid)):
-            cdf_vals[i] = _trapezoid(p_t_norm[:i+1], t_grid[:i+1])
-        self._sf_interp = interp1d(
-            t_grid, cdf_vals, bounds_error=False, fill_value=(0.0, 1.0)
-        )
-        self._t_grid = t_grid
+        loc = t_max - mu
+        a = (0 - loc) / sigma
+        b = (t_max - loc) / sigma
+        self._dist = truncnorm(a, b, loc=loc, scale=sigma)
 
     def p_time(self, t):
-        return self._pdf_interp(np.clip(t, 0, self._tmax))
+        return self._dist.pdf(t)
 
     def p_age(self, age):
-        return norm.pdf(age, loc=self._mu, scale=self._sigma)
+        return self._dist.pdf(self._tmax - age)
 
-    def survival(self, t):
-        return self._sf_interp(np.clip(t, 0, self._tmax))
+    def cdf(self, t):
+        return self._dist.cdf(np.clip(t, 0, self._tmax))
 
 
 """
@@ -621,7 +608,7 @@ class GCSDornanMixture(GCSMassModel):
             log_mgcs += self.scatter * np.random.normal(0, 1, size=log_mgcs.shape)
 
         if self.z_form_weight:
-            weight = self.age_model.survival(t)
+            weight = self.age_model.cdf(t)
             log_mgcs += np.log10(weight)
 
         return 10**log_mgcs
