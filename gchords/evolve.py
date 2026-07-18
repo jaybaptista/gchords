@@ -117,7 +117,7 @@ class FiducialMassLossModel(MassLossModel):
                 return self.relaxation_model.mass_loss_rate(m_cl, interpolated_strength(t))
 
             sol = solve_ivp(dMdt, (time[0], time[-1]), [initial_mass], t_eval=[time[-1]])
-            return sol.y[0]
+            return float(sol.y[0][0])
 
 
 class MamikonyanMassLossModel(MassLossModel):
@@ -157,4 +157,4 @@ class MamikonyanMassLossModel(MassLossModel):
             max_step=dt,
         )
 
-        return np.clip(sol.y[0], 0.0, None)
+        return float(np.clip(sol.y[0][-1], 0.0, None))
