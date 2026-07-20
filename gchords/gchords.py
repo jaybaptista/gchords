@@ -71,13 +71,33 @@ class GChords(object):
             # set not 'ok' weights to 0
             # mp[~ok] = 0.0
             
-            # e.g., if there aren't enough particles 
+            # e.g., if there aren't enough particles
             if np.sum(mp) <= 0.0:
                 # if I can't draw a particle tag, then I can't assign a GC, so skip this halo.
                 # NOTE: this may set a resolution floor for GC formation
                 continue
-            
-            
+
+            n_available = int(np.sum(mp > 0))
+
+            # resample the GC profile until the drawn count fits within the
+            # available non-zero particle slots, up to max_tries attempts
+            max_tries = 10
+            for _ in range(max_tries):
+                if len(_mgcs) <= n_available:
+                    break
+                _, _, _mgcs, _lgcs = self.gc_halo_model.generate(
+                    halo_mass=self.interface.infall_properties["halo_mass"][k],
+                    stellar_mass=self.interface.infall_properties["stellar_mass"][k],
+                )
+                if _mgcs is None:
+                    break
+            else:
+                # after max_tries, truncate to however many slots are available
+                _mgcs = _mgcs[:n_available]
+                _lgcs = _lgcs[:n_available]
+
+            if _mgcs is None or len(_mgcs) == 0:
+                continue
 
             p_draw = mp / np.sum(mp)
             draws = np.random.choice(len(mp), size=len(_mgcs), replace=False, p=p_draw)
