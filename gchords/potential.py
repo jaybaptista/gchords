@@ -12,16 +12,18 @@ class Potential(ABC):
         self.interface = interface
         self.phi = None
         self.write_dir = write_dir
-        self.potential_exists = False
+        self.potential_exists = self.check_potential_exists()
 
-        if os.path.exists(os.path.join(self.write_dir, 'potential.ini')):
+        if self.potential_exists:
             print("Potential file already exists. Reading potential from file...")
             self.read_potential(os.path.join(self.write_dir, 'potential.ini'))
-            self.potential_exists = True
 
     @abstractmethod
     def construct_potential(self):
         pass
+
+    def check_potential_exists(self):
+        return os.path.exists(os.path.join(self.write_dir, 'potential.ini'))
 
     def read_potential(self, directory):
         self.phi = agama.Potential(file=directory)
@@ -82,7 +84,51 @@ class AgamaPotential(Potential):
             eigenvalues = np.linalg.eigvals(tidal_tensor)
             return np.max(np.abs(eigenvalues))
 
-class SymphonyPotential(AgamaPotential):        
+class SymphonyPotential(AgamaPotential):
+    def check_potential_exists(self):
+        potential_ini = os.path.join(self.write_dir, 'potential.ini')
+
+        if not os.path.exists(potential_ini):
+            return False
+
+        missing = [
+            f for f in self._snapshot_files_in_potential(potential_ini)
+            if not os.path.exists(os.path.join(self.write_dir, f))
+        ]
+
+        if missing:
+            print(
+                f"potential.ini exists but is missing {len(missing)} snapshot file(s) "
+                f"it references (e.g. {missing[:5]}) -- treating the potential as incomplete."
+            )
+            return False
+
+        return True
+
+    def _snapshot_files_in_potential(self, potential_ini):
+        files = []
+        in_timestamps = False
+
+        with open(potential_ini) as f:
+            for line in f:
+                line = line.strip()
+                if line == 'Timestamps':
+                    in_timestamps = True
+                    continue
+                if not in_timestamps:
+                    continue
+                if not line:
+                    break
+                files.append(line.split()[1])
+
+        return files
+
+    def _existing_snapshot_numbers(self):
+        return sorted(
+            int(f.split('_')[1].split('.')[0])
+            for f in os.listdir(self.write_dir) if f.startswith('snap_') and f.endswith('.ini')
+        )
+
     def construct_potential(self, lmax, rmin=1e-2, rmax_rvir=1.2, nrad=25, mode='all', min_particles=100, symmetry='None', stride=1, overwrite=False):
         os.makedirs(self.write_dir, exist_ok=True)
 
@@ -90,11 +136,27 @@ class SymphonyPotential(AgamaPotential):
             print("Potential already exists. Use `overwrite=True` to reconstruct potential.")
             return
 
-        for snapshot in tqdm(range(len(self.interface.scale_factors)), desc="Constructing potentials..."):
-            
+        if overwrite:
+            start_snapshot_loop = 0
+        else:
+            existing = self._existing_snapshot_numbers()
+            if existing:
+                resume_snapshot = existing[-1]
+                print(
+                    f"Found an incomplete potential -- resuming construction from snapshot "
+                    f"{resume_snapshot}, which is regenerated in case it was left corrupted "
+                    f"by a previous failed run."
+                )
+                os.remove(os.path.join(self.write_dir, f'snap_{resume_snapshot}.ini'))
+                start_snapshot_loop = resume_snapshot
+            else:
+                start_snapshot_loop = 0
+
+        for snapshot in tqdm(range(start_snapshot_loop, len(self.interface.scale_factors)), desc="Constructing potentials..."):
+
             p_snap = self.interface.particles.read(snapshot, mode=mode, halo=0)
             x = p_snap['x'][p_snap['ok']]
-            
+
             if len(x) < min_particles:
                 # skip this snapshot if there are too few particles to construct a reliable potential
                 continue
@@ -109,14 +171,12 @@ class SymphonyPotential(AgamaPotential):
                 rmax=rmax_rvir * self.interface.rs["rvir"][0, snapshot],
                 gridSizeR=nrad,
                 particles=(x, m)
-            ) 
+            )
 
             potential.export(os.path.join(self.write_dir, f'snap_{snapshot}.ini'))
 
-        start_snapshot = min(
-            int(f.split('_')[1].split('.')[0]) for f in os.listdir(self.write_dir) if f.startswith('snap_')
-        )
-
+        existing_snapshots = set(self._existing_snapshot_numbers())
+        start_snapshot = min(existing_snapshots)
         end_snapshot = len(self.interface.scale_factors) - 1
 
         # times in Agama internal time units (~0.97779222 Gyr)
@@ -127,7 +187,10 @@ class SymphonyPotential(AgamaPotential):
             f.write("type=Evolving\n")
             f.write("interpLinear=True\n")
             f.write("Timestamps\n")
-            for k in np.arange(start_snapshot, end_snapshot + 1, stride):
+            for k in range(start_snapshot, end_snapshot + 1, stride):
+                if k not in existing_snapshots:
+                    # no potential was constructed for this snapshot (e.g. too few particles)
+                    continue
                 f.write(f"{age_int[k]} snap_{k}.ini\n")
             f.write("\n")
 

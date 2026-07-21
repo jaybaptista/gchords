@@ -18,6 +18,8 @@ class GChords(object):
         )
 
         self.is_manually_tagged = False
+        self.pool_files = None
+        self.pool_boundaries = None
 
     def set_particle_tags(self, particle_tags):
         self.particle_tags = particle_tags
@@ -28,6 +30,49 @@ class GChords(object):
         self.particle_tracks = particle_tracks['xv']
         self.particle_indices = particle_tracks['particle_index']
         self.index_to_pos = particle_tracks['mapping'].item()
+
+    def set_particle_pool(self, files):
+        '''
+        Pool particle tags across a set of realization csv files (e.g. from
+        generate_clusters()), concatenating their rows into particle_tags.
+
+        files: array of csv paths. Row order and per-file boundaries are
+            recorded so that write_to_pool() can later write results back
+            to each original file.
+        '''
+        self.pool_files = list(files)
+        dfs = [pd.read_csv(f) for f in self.pool_files]
+        self.pool_boundaries = np.cumsum([0] + [len(df) for df in dfs])
+        self.set_particle_tags(pd.concat(dfs, ignore_index=True))
+
+    def write_to_pool(self, xv=True):
+        '''
+        Write particle_tags (e.g. after compute_cluster_masses()) back to
+        the original files pooled by set_particle_pool(), splitting rows
+        by the same per-file boundaries used to concatenate them.
+
+        xv: if True, also attach each particle's z=0 phase-space
+            coordinates (x, y, z, vx, vy, vz) from particle_tracks.
+        '''
+        if self.pool_files is None:
+            raise ValueError("No particle pool found. Run set_particle_pool() first.")
+
+        df = self.particle_tags
+
+        if xv:
+            if self.particle_tracks is None:
+                raise ValueError("No particle tracks found. Run track_clusters() first.")
+
+            # last snapshot of each particle's track is its z=0 phase-space position
+            pos = np.array([
+                self.particle_tracks[-1, self.index_to_pos[idx], :]
+                for idx in df["particle_index"]
+            ])
+            df = df.copy()
+            df[["x", "y", "z", "vx", "vy", "vz"]] = pos
+
+        for k, f in enumerate(self.pool_files):
+            df.iloc[self.pool_boundaries[k]:self.pool_boundaries[k + 1]].to_csv(f, index=False)
 
     def generate_clusters(self, write_dir='particles.csv', seed=None, **kwargs):
         infall_snapshots = self.interface.infall_properties["infall_snapshot"]
@@ -214,7 +259,8 @@ class GChords(object):
                 _t.append([None])
                 _st.append([None])
                 _int_st.append([0.0])
-        
+                continue
+
             spl = [
                 UnivariateSpline(
                     age_int[start_snapshot:], xv[:, i], s=0, k=min(3, len(age_int[start_snapshot:]) - 1)
@@ -232,7 +278,13 @@ class GChords(object):
             spl_st = PchipInterpolator(t_sample, np.sqrt(st_sample)) # root of tidal frequency is `tidal strength`
             _int_st.append(spl_st.integrate(t_sample[0], t_sample[-1]))
 
-        np.savez_compressed(write_dir, tidal_field=np.array(_st, dtype=object), time=np.array(_t, dtype=object), integrated_tidal_field=_int_st)
+        np.savez_compressed(
+            write_dir,
+            tidal_field=np.array(_st, dtype=object),
+            time=np.array(_t, dtype=object),
+            integrated_tidal_field=_int_st,
+            particle_index=self.particle_indices,
+        )
 
     def compute_cluster_masses(self, tidal_data, mass_loss_model, write_dir='particles_evolved.csv', integrated=False):
         '''
@@ -255,8 +307,157 @@ class GChords(object):
                 self.particle_tags["evolved_mass"].values[i] = mass_loss_model.evolve_mass(initial_mass=self.particle_tags["gc_mass"].values[i], time=t_i, tidal_strength=st_i, integrated=False)        
 
         self.particle_tags.to_csv(write_dir, index=False)
+
+        if self.pool_files is not None:
+            self.write_to_pool(xv=False)
+
         return self.particle_tags['evolved_mass'].values
-    
+
+    def check_consistency(
+        self,
+        particles_npz='particles.npz',
+        tidal_field_npz='tidal_field.npz',
+        particle_tags=None,
+        evolved_csv=None,
+        raise_on_failure=True,
+    ):
+        '''
+        Validate that particle_tags, particles.npz (orbits), tidal_field.npz
+        (tidal history), and (optionally) an evolved-mass csv all refer to
+        the same set of particles in the same order.
+
+        particle_tags: optional DataFrame (e.g. a fresh concat of the
+            per-realization CSVs) to check row-for-row against
+            self.particle_tags. Skipped if None.
+        evolved_csv: optional path to a compute_cluster_masses() output csv
+            to check for traceability back to particles.npz. Skipped if None.
+        raise_on_failure: if True (default), raises ValueError listing every
+            failed check. If False, returns the list of failure strings
+            instead (empty list if everything passed).
+        '''
+        if self.particle_tags is None:
+            raise ValueError("No particle tags found. Run generate_clusters() first.")
+
+        failures = []
+        n_checks = [0]
+
+        def _check(name, ok, detail=None):
+            n_checks[0] += 1
+            print(f"[check_consistency] {name}: {'PASS' if ok else 'FAIL'}")
+            if not ok:
+                failures.append(detail if detail is not None else name)
+
+        # 1. row count: concatenated CSVs vs particle_tags
+        if particle_tags is not None:
+            ok = len(particle_tags) == len(self.particle_tags)
+            _check(
+                "row count (supplied particle_tags vs self.particle_tags)",
+                ok,
+                f"Row count mismatch: supplied particle_tags has {len(particle_tags)} rows, "
+                f"self.particle_tags has {len(self.particle_tags)} rows.",
+            )
+
+        particles_data = np.load(particles_npz, allow_pickle=True)
+        tidal_data = np.load(tidal_field_npz, allow_pickle=True)
+
+        npz_particle_index = particles_data["particle_index"]
+        mapping = particles_data["mapping"].item()
+
+        # 2. orphaned tags: every particle_index in particle_tags must be tracked
+        tag_idx = set(self.particle_tags["particle_index"].unique().tolist())
+        npz_idx = set(npz_particle_index.tolist())
+        orphans = tag_idx - npz_idx
+        _check(
+            "orphaned particle_index (particle_tags vs particles.npz)",
+            not orphans,
+            f"{len(orphans)} particle_index value(s) in particle_tags are missing from "
+            f"particles.npz's particle_index (e.g. {sorted(orphans)[:10]}).",
+        )
+
+        # 3. particles.npz internal self-consistency: mapping vs particle_index array
+        mapping_mismatches = [
+            (idx, pos) for idx, pos in mapping.items()
+            if pos >= len(npz_particle_index) or npz_particle_index[pos] != idx
+        ]
+        ok = (not mapping_mismatches) and (len(mapping) == len(npz_particle_index))
+        _check(
+            "particles.npz mapping vs particle_index self-consistency",
+            ok,
+            f"particles.npz mapping is inconsistent with its particle_index array: "
+            f"{len(mapping_mismatches)} mismatched entries (e.g. {mapping_mismatches[:10]}), "
+            f"len(mapping)={len(mapping)} vs len(particle_index)={len(npz_particle_index)}.",
+        )
+
+        # 4. row-count match: tidal_field.npz arrays vs particles.npz particle_index count
+        n_expected = len(npz_particle_index)
+        counts = {
+            "tidal_field": len(tidal_data["tidal_field"]),
+            "time": len(tidal_data["time"]),
+            "integrated_tidal_field": len(tidal_data["integrated_tidal_field"]),
+        }
+        ok = all(c == n_expected for c in counts.values())
+        _check(
+            "tidal_field.npz row counts vs particles.npz particle_index count",
+            ok,
+            f"tidal_field.npz array lengths {counts} do not all match "
+            f"particles.npz's particle_index count ({n_expected}).",
+        )
+
+        # 5. row identity/order between tidal_field.npz and particles.npz
+        if "particle_index" in tidal_data.files:
+            ok = np.array_equal(tidal_data["particle_index"], npz_particle_index)
+            _check(
+                "tidal_field.npz particle_index matches particles.npz particle_index (order+identity)",
+                ok,
+                "tidal_field.npz's particle_index array does not match particles.npz's "
+                "particle_index array element-wise -- the two files are misaligned.",
+            )
+        else:
+            print(
+                "[check_consistency] WARNING: tidal_field.npz has no 'particle_index' key "
+                "(older file format) -- only row counts were verified (check 4); row order/identity "
+                "cannot be confirmed. Re-run compute_cluster_tidal_field() to get a self-describing file."
+            )
+
+        # 6. per-particle shape sanity inside tidal_field.npz
+        shape_mismatches = [
+            i for i in range(len(tidal_data["time"]))
+            if len(tidal_data["time"][i]) != len(tidal_data["tidal_field"][i])
+        ]
+        _check(
+            "tidal_field.npz per-particle time/tidal_field shape match",
+            not shape_mismatches,
+            f"{len(shape_mismatches)} particle(s) have mismatched time/tidal_field lengths "
+            f"(e.g. indices {shape_mismatches[:10]}).",
+        )
+
+        # 7. evolved-output traceability
+        if evolved_csv is not None:
+            evolved_df = pd.read_csv(evolved_csv)
+            ok = len(evolved_df) == len(self.particle_tags)
+            _check(
+                "evolved csv row count vs self.particle_tags",
+                ok,
+                f"{evolved_csv} has {len(evolved_df)} rows, self.particle_tags has "
+                f"{len(self.particle_tags)} rows.",
+            )
+
+            evolved_orphans = set(evolved_df["particle_index"].unique().tolist()) - set(mapping.keys())
+            _check(
+                "evolved csv particle_index all present in particles.npz mapping",
+                not evolved_orphans,
+                f"{len(evolved_orphans)} particle_index value(s) in {evolved_csv} are missing "
+                f"from particles.npz's mapping (e.g. {sorted(evolved_orphans)[:10]}).",
+            )
+
+        print(f"[check_consistency] {n_checks[0] - len(failures)}/{n_checks[0]} checks passed.")
+
+        if failures and raise_on_failure:
+            raise ValueError(
+                "check_consistency() found the following issue(s):\n- " + "\n- ".join(failures)
+            )
+        return failures
+
     def apply_selection_function(self, selection_function, write_dir='particles_selected.csv'):
         if self.particle_tags is None:
             raise ValueError("No particle tags found. Run generate_clusters() first.")
