@@ -386,7 +386,7 @@ class DornanOccupationModel(OccupationModel):
 
 
 class DornanMstarOccupationModel(OccupationModel):
-    def __init__(self, b0=-0.29, b1=1.38, seed=None):
+    def __init__(self, b0=-10.64, b1=1.38, seed=None):
         super().__init__(seed=seed)
         self.kind = "stellar"
         self.b0 = b0
