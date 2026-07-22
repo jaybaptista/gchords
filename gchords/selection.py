@@ -8,6 +8,13 @@ import astropy.coordinates as coord
 Makes mock selections and generates a CSV of observable properties for the selected particles.
 '''
 
+DEFAULT_GALCEN_FRAME = coord.Galactocentric(
+    galcen_distance=8 * u.kpc,
+    z_sun=0 * u.pc,
+    roll=0 * u.deg,
+)
+
+
 class SelectionFunction(ABC):
     # fields generate_survey() needs from the particle dataframe
     required_fields = [
@@ -19,7 +26,9 @@ class SelectionFunction(ABC):
         "vx", "vy", "vz",
     ]
 
-    def __init__(self, frame, dist_cut=300.0, r_gc_cut=12.0, seed=None):
+    def __init__(self, frame=None, dist_cut=300.0, r_gc_cut=12.0, seed=None):
+        if frame is None:
+            frame = DEFAULT_GALCEN_FRAME
         self.frame = frame  # astropy coordinate frame giving the observer's position/orientation
         self.dist_cut = dist_cut  # heliocentric distance cut, kpc
         self.r_gc_cut = r_gc_cut  # inner galactocentric distance cut, kpc
@@ -92,7 +101,7 @@ class SelectionFunction(ABC):
 
 
 class SimpleGaiaSelectionFunction(SelectionFunction):
-    def __init__(self, frame, dist_cut=300.0, r_gc_cut=12.0, gaia_g_limit=21.0, lat_cut=10.0, seed=None):
+    def __init__(self, frame=None, dist_cut=300.0, r_gc_cut=12.0, gaia_g_limit=21.0, lat_cut=10.0, seed=None):
         super().__init__(frame, dist_cut=dist_cut, r_gc_cut=r_gc_cut, seed=seed)
         self.gaia_g_limit = gaia_g_limit
         self.lat_cut = lat_cut  # minimum |galactic latitude|, deg

@@ -4,6 +4,7 @@ import symlib
 from tqdm import tqdm
 from scipy.interpolate import UnivariateSpline, PchipInterpolator
 from gchords.sampler import ValcinAgeModel
+from gchords import potential
 
 class GChords(object):
     def __init__(self, interface, gc_halo_model, age_model=None, **kwargs):
@@ -93,6 +94,7 @@ class GChords(object):
                     "feh",
                     "a_form",
                     "infall_host_mstar",
+                    "is_bound",
                 ]
             )
         
@@ -171,6 +173,7 @@ class GChords(object):
                         "nimbus_index": draws,
                         "feh": feh,
                         "a_form": a_form,
+                        "is_bound": np.repeat(True, len(_mgcs)),
                     }
                 )
             )
@@ -239,7 +242,55 @@ class GChords(object):
         # flattened index of particles tagged with GCs
         self.particle_tags["particle_index"] = self.particle_tags["nimbus_index"] + starts[self.particle_tags["halo_index"]]
         return self.particle_tags["particle_index"].unique()
-    
+
+    def compute_boundedness(self, write_dir='particles.csv'):
+        '''
+        Flags whether each GC particle tag is still bound to its progenitor
+        subhalo at the last snapshot. `is_bound` defaults to True and is set
+        to False if the subhalo disrupts, is untracked (rs['ok'] is False)
+        at the last snapshot, or the tagged particle is dynamically unbound
+        from its subhalo's remaining particles (via potential.is_bound()).
+        '''
+        if self.particle_tags is None:
+            raise ValueError("No particle tags found. Run generate_clusters() first.")
+
+        last_snapshot = len(self.interface.scale_factors) - 1
+        self.particle_tags["is_bound"] = True
+
+        for halo_index, group in tqdm(
+            self.particle_tags.groupby("halo_index"), desc="Checking cluster boundedness..."
+        ):
+            subhalo_lost = (
+                (group["disrupt_snap"].values[0] != -1)
+                or (not self.interface.rs[halo_index, last_snapshot]["ok"])
+            )
+
+            if subhalo_lost:
+                self.particle_tags.loc[group.index, "is_bound"] = False
+                continue
+
+            p_sub = self.interface.particles.read(last_snapshot, mode="stars", halo=halo_index)
+            ok = p_sub["ok"]
+            pos_in_filtered = np.cumsum(ok) - 1
+
+            subhalo_pos = self.interface.rs[halo_index, last_snapshot]["x"]
+            subhalo_vel = self.interface.rs[halo_index, last_snapshot]["v"]
+
+            bound_ok = potential.is_bound(
+                p_sub["x"][ok], p_sub["v"][ok], subhalo_pos, subhalo_vel, self.interface.params
+            )
+
+            for i in group.index:
+                idx = self.particle_tags.at[i, "nimbus_index"]
+                self.particle_tags.at[i, "is_bound"] = bool(ok[idx]) and bool(bound_ok[pos_in_filtered[idx]])
+
+        self.particle_tags.to_csv(write_dir, index=False)
+
+        if self.pool_files is not None:
+            self.write_to_pool(xv=False)
+
+        return self.particle_tags["is_bound"].values
+
     def compute_cluster_tidal_field(self, potential, write_dir='tidal_field.npz'):
         if self.particle_tracks is None:
             raise ValueError("No particle tracks found. Run track_clusters() first.")
