@@ -113,7 +113,11 @@ class SimpleGaiaSelectionFunction(SelectionFunction):
         Solar G band is roughly 4.7 (https://arxiv.org/pdf/1904.04841)
         '''
         M_sun_G = 4.7
-        return M_sun_G - 2.5 * np.log10(luminosity)
+        # evolved_mass (and hence luminosity) is exactly 0 for fully disrupted
+        # clusters; log10(0) = -inf is the mathematically correct result (an
+        # infinitely faint absolute magnitude), so just silence the warning.
+        with np.errstate(divide="ignore"):
+            return M_sun_G - 2.5 * np.log10(luminosity)
 
     def get_apparent_g(self, M_G, distance):
         # distance in kpc
