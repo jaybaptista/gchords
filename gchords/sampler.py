@@ -149,11 +149,11 @@ class OccupationModel(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def p_gc(self, **kwargs):
+    def p_gc(self, mass, z=None):
         pass
 
     @abc.abstractmethod
-    def has_gc(self, **kwargs):
+    def has_gc(self, mass, z=None):
         pass
 
 
@@ -357,12 +357,12 @@ class EadieOccupationModel(OccupationModel):
     def var_names(self):
         return ["b0", "b1"]
 
-    def p_gc(self, stellar_mass):
+    def p_gc(self, stellar_mass, z=None):
         p = (1 + np.exp(-1 * (self.b0 + self.b1 * np.log10(stellar_mass)))) ** (-1)
         return p
 
-    def has_gc(self, stellar_mass):
-        p = self.p_gc(stellar_mass)
+    def has_gc(self, stellar_mass, z=None):
+        p = self.p_gc(stellar_mass, z=z)
         return uniform.rvs() < p
 
 
@@ -376,13 +376,67 @@ class DornanOccupationModel(OccupationModel):
     def var_names(self):
         return ["b0", "b1"]
 
-    def p_gc(self, halo_mass):
+    def p_gc(self, halo_mass, z=None):
         p = 1 / (1 + np.exp(-(self.b0 + self.b1 * np.log10(halo_mass))))
         return p
 
-    def has_gc(self, halo_mass):
-        p = self.p_gc(halo_mass)
+    def has_gc(self, halo_mass, z=None):
+        p = self.p_gc(halo_mass, z=z)
         return uniform.rvs() < p
+
+
+class DornanOccupationModelInSitu(OccupationModel):
+    """
+    In-situ variant of DornanOccupationModel.
+
+    Builds an interpolator over (log_mhalo, lookback_time) → p_gc by tracing
+    each halo's mean MAH and anchoring p_gc to the z=0 peak halo mass via the
+    Dornan logistic relation.
+    """
+
+    def __init__(self, b0=-31.86, b1=3.0, masses=None, z_eval=None, seed=None):
+        super().__init__(seed=seed)
+        self.kind = "halo"
+        self.b0 = b0
+        self.b1 = b1
+
+        if masses is None:
+            masses = np.logspace(7, 14, 50)
+        if z_eval is None:
+            z_eval = np.linspace(0, 20, 100)
+
+        self._interp = self._build_interpolator(masses, z_eval)
+
+    def _p_gc_z0(self, halo_mass):
+        return 1 / (1 + np.exp(-(self.b0 + self.b1 * np.log10(halo_mass))))
+
+    def _build_interpolator(self, masses, z_eval):
+        log_mhalo_pts, t_pts, p_gc_vals = [], [], []
+
+        for mass in masses:
+            zs, m_track = mean_mah(mass, z_eval=z_eval)
+            p_z0 = self._p_gc_z0(m_track[0])
+            t = np.array([cosmo.age(z) for z in zs])
+            log_mhalo_pts.extend(np.log10(m_track))
+            t_pts.extend(t)
+            p_gc_vals.extend(np.full(len(zs), p_z0))
+
+        return LinearNDInterpolator(
+            np.column_stack([log_mhalo_pts, t_pts]),
+            np.array(p_gc_vals),
+        )
+
+    def var_names(self):
+        return ["b0", "b1"]
+
+    def p_gc(self, halo_mass, z=0.0):
+        halo_mass = np.atleast_1d(np.asarray(halo_mass, dtype=float))
+        t = np.full_like(halo_mass, cosmo.age(z if z is not None else 0.0))
+        return self._interp(np.log10(halo_mass), t)
+
+    def has_gc(self, halo_mass, z=0.0):
+        p = self.p_gc(halo_mass, z=z)
+        return uniform.rvs() < float(p)
 
 
 class DornanMstarOccupationModel(OccupationModel):
@@ -395,12 +449,12 @@ class DornanMstarOccupationModel(OccupationModel):
     def var_names(self):
         return ["b0", "b1"]
 
-    def p_gc(self, stellar_mass):
+    def p_gc(self, stellar_mass, z=None):
         p = 1 / (1 + np.exp(-(self.b0 + self.b1 * np.log10(stellar_mass))))
         return p
 
-    def has_gc(self, stellar_mass):
-        p = self.p_gc(stellar_mass)
+    def has_gc(self, stellar_mass, z=None):
+        p = self.p_gc(stellar_mass, z=z)
         return uniform.rvs() < p
 
 
