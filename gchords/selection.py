@@ -24,6 +24,7 @@ class SelectionFunction(ABC):
         "evolved_mass",
         "x", "y", "z",
         "vx", "vy", "vz",
+        "is_bound",
     ]
 
     def __init__(self, frame=None, dist_cut=300.0, r_gc_cut=12.0, seed=None):
@@ -132,7 +133,8 @@ class SimpleGaiaSelectionFunction(SelectionFunction):
         galactic_b = coord.SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs").galactic.b.deg
 
         return (
-            (r_gc >= self.r_gc_cut)
+            (~particles["is_bound"].values)
+            & (r_gc >= self.r_gc_cut)
             & (distance <= self.dist_cut)
             & (app_g < self.gaia_g_limit)
             & (np.abs(galactic_b) >= self.lat_cut)
