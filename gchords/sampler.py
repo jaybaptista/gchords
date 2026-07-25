@@ -819,25 +819,26 @@ class GCHaloModel:
         occ_mass = halo_mass if self.occupation_model.kind == "halo" else stellar_mass
         has_gc = self.occupation_model.has_gc(occ_mass, z=z)
 
+        _empty = np.array([])
+
         if not has_gc:
-            return False, 0, [], []
+            return False, 0, _empty, _empty
 
         mass_input = halo_mass if self.mass_model.kind == "halo" else stellar_mass
         mass_kwargs = {"z": z} if z is not None else {}
         gc_mass = self.mass_model.mass(mass_input, **mass_kwargs)
 
         if gc_mass <= 0:
-            return True, 0, None, None
+            return True, 0, _empty, _empty
 
         if self.gclf_model.kind == "halo":
-            # update GCLF parameters
             self.gclf_model.set_halo_mass(halo_mass)
 
         lam = gc_mass / self.gclf_model.mean_mass
 
         if lam <= 0 or np.isnan(lam):
             print(f"ERROR: gc_mass / mean_gc_mass = {lam}")
-            return True, 0, None, None
+            return True, 0, _empty, _empty
 
         n_draws = np.random.poisson(lam)
 
