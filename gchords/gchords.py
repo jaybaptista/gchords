@@ -153,7 +153,7 @@ class GChords(object):
             )
 
             # skip halos with no GCs or infall onto non-central host
-            if (_mgcs is None) or (self.interface.infall_properties["preinfall_host_idx"][k] != -1):
+            if (len(_mgcs) == 0) or (self.interface.infall_properties["preinfall_host_idx"][k] != -1):
                 continue
 
             mp = self.weights[k]['mp']
@@ -183,14 +183,14 @@ class GChords(object):
                     stellar_mass=self.interface.infall_properties["stellar_mass"][k],
                     z=z_infall,
                 )
-                if _mgcs is None:
+                if len(_mgcs) == 0:
                     break
             else:
                 # after max_tries, truncate to however many slots are available
                 _mgcs = _mgcs[:n_available]
                 _lgcs = _lgcs[:n_available]
 
-            if _mgcs is None or len(_mgcs) == 0:
+            if len(_mgcs) == 0:
                 continue
 
             p_draw = mp / np.sum(mp)
