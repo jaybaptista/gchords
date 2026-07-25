@@ -140,9 +140,16 @@ class GChords(object):
         rows = []
 
         for k in np.arange(1, n_halos):
+            infall_snap_k = infall_snapshots[k]
+            if 0 <= infall_snap_k < len(self.interface.scale_factors):
+                z_infall = 1.0 / self.interface.scale_factors[infall_snap_k] - 1.0
+            else:
+                z_infall = None
+
             _, _, _mgcs, _lgcs = self.gc_halo_model.generate(
                 halo_mass=self.interface.infall_properties["halo_mass"][k],
                 stellar_mass=self.interface.infall_properties["stellar_mass"][k],
+                z=z_infall,
             )
 
             # skip halos with no GCs or infall onto non-central host
@@ -174,6 +181,7 @@ class GChords(object):
                 _, _, _mgcs, _lgcs = self.gc_halo_model.generate(
                     halo_mass=self.interface.infall_properties["halo_mass"][k],
                     stellar_mass=self.interface.infall_properties["stellar_mass"][k],
+                    z=z_infall,
                 )
                 if _mgcs is None:
                     break
@@ -217,7 +225,9 @@ class GChords(object):
             )
 
         if not rows:
-            df.to_csv(write_dir, index=False)
+            self.particle_tags = df
+            self.particle_tags.to_csv(write_dir, index=False)
+            return
 
         self.particle_tags = pd.concat(rows, ignore_index=True)
         self.particle_tags.to_csv(write_dir, index=False)
@@ -299,7 +309,7 @@ class GChords(object):
             if start_snapshot == len(self.interface.scale_factors) - 1:
                 _t.append([None])
                 _st.append([None])
-                _int_st.append([0.0])
+                _int_st.append(0.0)
                 continue
 
             spl = [

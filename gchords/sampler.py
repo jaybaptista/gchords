@@ -478,7 +478,7 @@ class GCSMassLinearModel(GCSMassModel):
     def var_names(self):
         return ["g0", "g1"]
 
-    def mass(self, stellar_mass):
+    def mass(self, stellar_mass, z=None):
         return 10 ** (self.g0 + self.g1 * np.log10(stellar_mass))
 
 
@@ -499,7 +499,7 @@ class GCSMassHarrisModel(GCSMassModel):
     def var_names(self):
         return ["g0", "g1", "scatter"]
 
-    def mass(self, halo_mass):
+    def mass(self, halo_mass, z=None):
         eta = 2.9e-5
         mhalo = eta * halo_mass
 
@@ -528,7 +528,7 @@ class GCSMassDornanModel(GCSMassModel):
     def var_names(self):
         return ["slope", "intercept", "scatter"]
 
-    def mass(self, halo_mass, seed=None):
+    def mass(self, halo_mass, z=None, seed=None):
         if seed is not None:
             np.random.seed(seed)
 
@@ -593,7 +593,7 @@ class GCSDornanMassInSitu(GCSMassModel):
         if cosmology is None:
             cosmology = cosmo
         halo_mass = np.atleast_1d(np.asarray(halo_mass, dtype=float))
-        t = np.full_like(halo_mass, cosmology.age(z))
+        t = np.full_like(halo_mass, cosmology.age(z if z is not None else 0.0))
         log_mgcs = self._interp(np.log10(halo_mass), t)
 
         if self.scatter > 0:
@@ -650,7 +650,7 @@ class GCSDornanMixture(GCSMassModel):
         if cosmology is None:
             cosmology = cosmo
         halo_mass = np.atleast_1d(np.asarray(halo_mass, dtype=float))
-        t = cosmology.age(z)
+        t = cosmology.age(z if z is not None else 0.0)
 
         log_insitu = np.log10(self._insitu.mass(halo_mass, z=z, cosmology=cosmology))
         log_exsitu = np.log10(self._exsitu.mass(halo_mass))
@@ -809,7 +809,7 @@ class GCHaloModel:
 
         halo_mass = kwargs.get("halo_mass")
         stellar_mass = kwargs.get("stellar_mass")
-        # TODO: add redshift evolution
+        z = kwargs.get("z")
 
         if halo_mass is None:
             raise ValueError("halo_mass not supplied")
@@ -819,14 +819,16 @@ class GCHaloModel:
         has_gc = self.occupation_model.has_gc(
             halo_mass
             if self.occupation_model.kind == "halo"
-            else stellar_mass
+            else stellar_mass,
+            z=z,
         )
 
         if not has_gc:
             return False, 0, [], []
 
         gc_mass = self.mass_model.mass(
-            halo_mass if self.mass_model.kind == "halo" else stellar_mass
+            halo_mass if self.mass_model.kind == "halo" else stellar_mass,
+            z=z,
         )
 
         if gc_mass <= 0:
