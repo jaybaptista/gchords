@@ -809,25 +809,22 @@ class GCHaloModel:
 
         halo_mass = kwargs.get("halo_mass")
         stellar_mass = kwargs.get("stellar_mass")
-        # TODO: add redshift evolution
+        z = kwargs.get("z", None)
 
         if halo_mass is None:
             raise ValueError("halo_mass not supplied")
         if stellar_mass is None:
             raise ValueError("stellar_mass not supplied")
 
-        has_gc = self.occupation_model.has_gc(
-            halo_mass
-            if self.occupation_model.kind == "halo"
-            else stellar_mass
-        )
+        occ_mass = halo_mass if self.occupation_model.kind == "halo" else stellar_mass
+        has_gc = self.occupation_model.has_gc(occ_mass, z=z)
 
         if not has_gc:
             return False, 0, [], []
 
-        gc_mass = self.mass_model.mass(
-            halo_mass if self.mass_model.kind == "halo" else stellar_mass
-        )
+        mass_input = halo_mass if self.mass_model.kind == "halo" else stellar_mass
+        mass_kwargs = {"z": z} if z is not None else {}
+        gc_mass = self.mass_model.mass(mass_input, **mass_kwargs)
 
         if gc_mass <= 0:
             return True, 0, None, None

@@ -140,9 +140,14 @@ class GChords(object):
         rows = []
 
         for k in np.arange(1, n_halos):
+            infall_snap = infall_snapshots[k]
+            infall_a = self.interface.scale_factors[infall_snap]
+            infall_z = 1.0 / infall_a - 1.0
+
             _, _, _mgcs, _lgcs = self.gc_halo_model.generate(
                 halo_mass=self.interface.infall_properties["halo_mass"][k],
                 stellar_mass=self.interface.infall_properties["stellar_mass"][k],
+                z=infall_z,
             )
 
             # skip halos with no GCs or infall onto non-central host
