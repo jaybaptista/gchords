@@ -355,7 +355,14 @@ class GChords(object):
                 # get the time and tidal strength for this particle's track
                 t_i = t[self.index_to_pos[self.particle_tags["particle_index"].values[i]]]
                 st_i = st[self.index_to_pos[self.particle_tags["particle_index"].values[i]]]
-                self.particle_tags["evolved_mass"].values[i] = mass_loss_model.evolve_mass(initial_mass=self.particle_tags["gc_mass"].values[i], time=t_i, tidal_strength=st_i, integrated=False)        
+                if len(t_i) < 2:
+                    # untracked cluster (particle track starts only at the final snapshot,
+                    # see compute_cluster_tidal_field's skip-branch) -- no tidal history to
+                    # interpolate against, so treat as no mass loss, matching the
+                    # integrated=True path's `_int_st.append(0.0)` sentinel.
+                    self.particle_tags["evolved_mass"].values[i] = self.particle_tags["gc_mass"].values[i]
+                    continue
+                self.particle_tags["evolved_mass"].values[i] = mass_loss_model.evolve_mass(initial_mass=self.particle_tags["gc_mass"].values[i], time=t_i, tidal_strength=st_i, integrated=False)
 
         self.particle_tags.to_csv(write_dir, index=False)
 
