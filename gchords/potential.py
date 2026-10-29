@@ -7,6 +7,10 @@ from tqdm import tqdm
 
 agama.setUnits(length=1.0, mass=1.0, velocity=1.0)
 
+def agama_times(cosmology, scale_factors):
+    # cosmic age at each scale factor in Agama internal time units (~0.97779222 Gyr)
+    return cosmology.age(1/np.asarray(scale_factors) - 1) / 0.97779222
+
 class Potential(ABC):
     def __init__(self, interface, write_dir):
         self.interface = interface
@@ -37,6 +41,10 @@ class Potential(ABC):
         if self.phi is None:
             raise ValueError("Potential not constructed or read from file.")
         pass
+
+    def circular_energy_radius(self, *args, **kwargs):
+        # per-snapshot energy of a circular orbit vs radius, E_c(r) = U(r) + K_circ(r); not available by default
+        return None
 
 class AgamaPotential(Potential):
     def tidal_tensor(self, x, t=0.0):
@@ -179,8 +187,7 @@ class SymphonyPotential(AgamaPotential):
         start_snapshot = min(existing_snapshots)
         end_snapshot = len(self.interface.scale_factors) - 1
 
-        # times in Agama internal time units (~0.97779222 Gyr)
-        age_int = self.interface.cosmology.age(1/self.interface.scale_factors - 1) / 0.97779222
+        age_int = self._agama_times()
 
         with open(os.path.join(self.write_dir, 'potential.ini'), 'w') as f:
             f.write("[Potential]\n")
@@ -196,6 +203,77 @@ class SymphonyPotential(AgamaPotential):
 
         self.phi = agama.Potential(file=os.path.join(self.write_dir, 'potential.ini'))
         self.potential_exists = True
+
+    def _agama_times(self):
+        return agama_times(self.interface.cosmology, self.interface.scale_factors)
+
+    def circular_energy_radius(self, r_edges=None, snapshots=None, mode='all', min_particles=100, min_bin_particles=10,
+                               file_name='circular_energy_radius.npz', overwrite=False):
+        '''
+        Tabulates the energy of a circular orbit vs radius, E_c(r) = U(r) + K_circ(r), for the host at each snapshot,
+        on radial bins shared by all snapshots, and writes it to write_dir/file_name.
+
+        U is the median over the bound host particles in a bin of the potential from symlib.profile_info, after
+        undoing its PE/vmax**2 scaling and its 4 G M / R_out outer boundary term (should be G M / R_out).
+        K_circ = G M(<r) / (2 r) at the bin's median radius r, with M(<r) from all valid host particles.
+        Bins with fewer than min_bin_particles bound particles, and snapshots with fewer than min_particles
+        valid particles, are NaN. Energies are in km^2/s^2, radii in physical kpc.
+
+        Returns a dict of the saved arrays, each (n_snapshots, n_bins) unless noted:
+            snapshots, scale_factor, time (n_snapshots; time in Agama units, as in potential.ini),
+            r_edges (n_bins + 1), r_med, n_bound, U_p16, U_p50, U_p84, K_circ, E_circ
+        '''
+        path = os.path.join(self.write_dir, file_name)
+        if os.path.exists(path) and not overwrite:
+            print(f"{path} already exists. Use `overwrite=True` to recompute it.")
+            return dict(np.load(path))
+        os.makedirs(self.write_dir, exist_ok=True)
+
+        if r_edges is None:
+            r_edges = np.logspace(-2, np.log10(2e3), 51)
+        r_edges = np.asarray(r_edges, dtype=float)
+        n_bins = len(r_edges) - 1
+        if snapshots is None:
+            snapshots = np.arange(len(self.interface.scale_factors))
+        snapshots = np.asarray(snapshots, dtype=int)
+
+        params, mp, G = self.interface.params, self.interface.mp, agama.G
+        out = {k: np.full((len(snapshots), n_bins), np.nan) for k in ('r_med', 'U_p16', 'U_p50', 'U_p84', 'K_circ')}
+        out['n_bound'] = np.zeros((len(snapshots), n_bins), dtype=int)
+
+        for i, snapshot in enumerate(tqdm(snapshots, desc="Tabulating circular energies...")):
+            p_snap = self.interface.particles.read(snapshot, mode=mode, halo=0)
+            ok = p_snap['ok']
+            if np.sum(ok) < min_particles:
+                continue
+
+            _, vmax, pe, _ = symlib.profile_info(params, p_snap['x'], ok)
+            r = np.linalg.norm(p_snap['x'], axis=1)
+            # profile_info places its outer boundary at the largest radius of any particle, valid or not
+            r_out = np.sqrt(np.nanmax(r)**2 + params['eps']**2)
+            U = pe * vmax**2 + 3 * G * np.sum(ok) * mp / r_out
+            E = np.sum(p_snap['v']**2, axis=1) / 2 + U
+
+            bound = ok & (E < 0) & (r > 0)
+            r_b, U_b = r[bound], U[bound]
+            idx = np.digitize(r_b, r_edges) - 1
+            r_valid = np.sort(r[ok])
+            for j in range(n_bins):
+                in_bin = idx == j
+                n = np.sum(in_bin)
+                out['n_bound'][i, j] = n
+                if n < min_bin_particles:
+                    continue
+                r_med = np.median(r_b[in_bin])
+                out['r_med'][i, j] = r_med
+                out['U_p16'][i, j], out['U_p50'][i, j], out['U_p84'][i, j] = np.percentile(U_b[in_bin], [16, 50, 84])
+                out['K_circ'][i, j] = G * np.searchsorted(r_valid, r_med) * mp / (2 * r_med)
+
+        out['E_circ'] = out['U_p50'] + out['K_circ']
+        out.update(snapshots=snapshots, scale_factor=self.interface.scale_factors[snapshots],
+                   time=self._agama_times()[snapshots], r_edges=r_edges)
+        np.savez_compressed(path, **out)
+        return out
 
     def construct_potential_subhalo(self, halo_index, lmax, rmin=1e-2, rmax_rvir=1.2, nrad=25, mode='all', min_particles=100, symmetry='None', stride=1, overwrite=False):
         os.makedirs(self.write_dir, exist_ok=True)
