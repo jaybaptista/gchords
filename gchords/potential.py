@@ -207,21 +207,32 @@ class SymphonyPotential(AgamaPotential):
     def _agama_times(self):
         return agama_times(self.interface.cosmology, self.interface.scale_factors)
 
-    def circular_energy_radius(self, r_edges=None, snapshots=None, mode='all', min_particles=100, min_bin_particles=10,
-                               file_name='circular_energy_radius.npz', overwrite=False):
+    def circular_energy_radius(self, n_points=50, r_min=1e-2, r_max=2e3, spacing='log', snapshots=None, mode='all',
+                               min_particles=100, k_density=32, file_name='circular_energy_radius.npz', overwrite=False):
         '''
-        Tabulates the energy of a circular orbit vs radius, E_c(r) = U(r) + K_circ(r), for the host at each snapshot,
-        on radial bins shared by all snapshots, and writes it to write_dir/file_name.
+        Tabulates the energy of a circular orbit vs radius, E_c(r) = U(r) + K_circ(r), and the tidal strength for the
+        host at each snapshot, on a subsample of bound host particles (no binning), and writes it to write_dir/file_name.
 
-        U is the median over the bound host particles in a bin of the potential from symlib.profile_info, after
-        undoing its PE/vmax**2 scaling and its 4 G M / R_out outer boundary term (should be G M / R_out).
-        K_circ = G M(<r) / (2 r) at the bin's median radius r, with M(<r) from all valid host particles.
-        Bins with fewer than min_bin_particles bound particles, and snapshots with fewer than min_particles
-        valid particles, are NaN. Energies are in km^2/s^2, radii in physical kpc.
+        At each snapshot, n_points target radii are placed evenly (in log r if spacing='log', else linearly) on
+        [r_min, r_max], and the bound valid host particle nearest to each target (in log r or r) is selected; a
+        particle picked for several targets is kept once, and the remaining columns are NaN.
 
-        Returns a dict of the saved arrays, each (n_snapshots, n_bins) unless noted:
+        U is the per-particle potential from symlib.profile_info, after undoing its PE/vmax**2 scaling and its
+        4 G M / R_out outer boundary term (should be G M / R_out). The tidal strength and K_circ are from the
+        unsoftened spherical potential of the enclosed mass M(<r) (profile_info's own softening, which shifts r to
+        sqrt(r**2 + eps**2) with eps in comoving kpc/h, is ignored), whose Hessian has eigenvalues
+            lambda_t = (1/r) dU/dr = G M / r**3                  (tangential, twice)
+            lambda_r = d2U/dr2    = 4 pi G rho - 2 G M / r**3    (radial)
+        with M(<r) from all valid host particles and 4 pi r**2 rho = dM/dr estimated from the k_density valid
+        particles on either side in radius. The tidal strength is max(|lambda_r|, |lambda_t|) in Gyr^-2, the same
+        definition and units as AgamaPotential.tidal_strength * 1.0459401725324529 in compute_cluster_tidal_field.
+        K_circ = v_c**2 / 2 = G M / (2 r). Snapshots with fewer than min_particles valid particles are NaN.
+        Energies are in km^2/s^2, radii in physical kpc.
+
+        Returns a dict of the saved arrays, each (n_snapshots, n_points) unless noted:
             snapshots, scale_factor, time (n_snapshots; time in Agama units, as in potential.ini),
-            r_edges (n_bins + 1), r_med, n_bound, U_p16, U_p50, U_p84, K_circ, E_circ
+            r_target (n_points), r, particle_index (index into the snapshot's host particles, -1 if empty),
+            U, K, E (the particle's own energy, K + U), K_circ, E_circ, M_enc, lambda_r, lambda_t, tidal_strength
         '''
         path = os.path.join(self.write_dir, file_name)
         if os.path.exists(path) and not overwrite:
@@ -229,17 +240,20 @@ class SymphonyPotential(AgamaPotential):
             return dict(np.load(path))
         os.makedirs(self.write_dir, exist_ok=True)
 
-        if r_edges is None:
-            r_edges = np.logspace(-2, np.log10(2e3), 51)
-        r_edges = np.asarray(r_edges, dtype=float)
-        n_bins = len(r_edges) - 1
+        if spacing == 'log':
+            r_target = np.logspace(np.log10(r_min), np.log10(r_max), n_points)
+        elif spacing == 'linear':
+            r_target = np.linspace(r_min, r_max, n_points)
+        else:
+            raise ValueError("spacing must be 'log' or 'linear'.")
         if snapshots is None:
             snapshots = np.arange(len(self.interface.scale_factors))
         snapshots = np.asarray(snapshots, dtype=int)
 
         params, mp, G = self.interface.params, self.interface.mp, agama.G
-        out = {k: np.full((len(snapshots), n_bins), np.nan) for k in ('r_med', 'U_p16', 'U_p50', 'U_p84', 'K_circ')}
-        out['n_bound'] = np.zeros((len(snapshots), n_bins), dtype=int)
+        keys = ('r', 'U', 'K', 'E', 'K_circ', 'E_circ', 'M_enc', 'lambda_r', 'lambda_t', 'tidal_strength')
+        out = {k: np.full((len(snapshots), n_points), np.nan) for k in keys}
+        out['particle_index'] = np.full((len(snapshots), n_points), -1, dtype=int)
 
         for i, snapshot in enumerate(tqdm(snapshots, desc="Tabulating circular energies...")):
             p_snap = self.interface.particles.read(snapshot, mode=mode, halo=0)
@@ -252,26 +266,47 @@ class SymphonyPotential(AgamaPotential):
             # profile_info places its outer boundary at the largest radius of any particle, valid or not
             r_out = np.sqrt(np.nanmax(r)**2 + params['eps']**2)
             U = pe * vmax**2 + 3 * G * np.sum(ok) * mp / r_out
-            E = np.sum(p_snap['v']**2, axis=1) / 2 + U
+            K = np.sum(p_snap['v']**2, axis=1) / 2
+            E = K + U
 
-            bound = ok & (E < 0) & (r > 0)
-            r_b, U_b = r[bound], U[bound]
-            idx = np.digitize(r_b, r_edges) - 1
+            # nearest bound particle to each target radius, each particle used at most once
+            bound_idx = np.where(ok & (E < 0) & (r > 0))[0]
+            if len(bound_idx) == 0:
+                continue
+            bound_idx = bound_idx[np.argsort(r[bound_idx])]
+            r_b = r[bound_idx]
+            coord = np.log10 if spacing == 'log' else (lambda a: a)
+            j = np.clip(np.searchsorted(coord(r_b), coord(r_target)), 1, len(r_b) - 1)
+            j = np.where(np.abs(coord(r_b[j - 1]) - coord(r_target)) <= np.abs(coord(r_b[j]) - coord(r_target)),
+                         j - 1, j) if len(r_b) > 1 else np.zeros(n_points, dtype=int)
+            sel = bound_idx[np.unique(j)]
+            n_sel = len(sel)
+
+            # enclosed mass and local density from the valid particles, as seen by profile_info
             r_valid = np.sort(r[ok])
-            for j in range(n_bins):
-                in_bin = idx == j
-                n = np.sum(in_bin)
-                out['n_bound'][i, j] = n
-                if n < min_bin_particles:
-                    continue
-                r_med = np.median(r_b[in_bin])
-                out['r_med'][i, j] = r_med
-                out['U_p16'][i, j], out['U_p50'][i, j], out['U_p84'][i, j] = np.percentile(U_b[in_bin], [16, 50, 84])
-                out['K_circ'][i, j] = G * np.searchsorted(r_valid, r_med) * mp / (2 * r_med)
+            r_s = r[sel]
+            n_enc = np.searchsorted(r_valid, r_s)
+            M = n_enc * mp
+            lo = np.clip(n_enc - k_density, 0, len(r_valid) - 1)
+            hi = np.clip(n_enc + k_density, 0, len(r_valid) - 1)
+            dMdr = (hi - lo) * mp / (r_valid[hi] - r_valid[lo])
+            rho = dMdr / (4 * np.pi * r_s**2)
 
-        out['E_circ'] = out['U_p50'] + out['K_circ']
+            lam_t = G * M / r_s**3
+            lam_r = 4 * np.pi * G * rho - 2 * G * M / r_s**3
+            K_circ = G * M / (2 * r_s)
+
+            row = slice(0, n_sel)
+            out['particle_index'][i, row] = sel
+            out['r'][i, row], out['M_enc'][i, row] = r_s, M
+            out['U'][i, row], out['K'][i, row], out['E'][i, row] = U[sel], K[sel], E[sel]
+            out['K_circ'][i, row], out['E_circ'][i, row] = K_circ, U[sel] + K_circ
+            out['lambda_r'][i, row], out['lambda_t'][i, row] = lam_r, lam_t
+            # (km/s/kpc)^2 -> Gyr^-2, as in GChords.compute_cluster_tidal_field
+            out['tidal_strength'][i, row] = np.maximum(np.abs(lam_r), np.abs(lam_t)) * 1.0459401725324529
+
         out.update(snapshots=snapshots, scale_factor=self.interface.scale_factors[snapshots],
-                   time=self._agama_times()[snapshots], r_edges=r_edges)
+                   time=self._agama_times()[snapshots], r_target=r_target)
         np.savez_compressed(path, **out)
         return out
 
