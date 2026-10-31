@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import symlib
@@ -21,6 +22,7 @@ class GChords(object):
         self.is_manually_tagged = False
         self.pool_files = None
         self.pool_boundaries = None
+        self.circEr = None
 
     def set_particle_tags(self, particle_tags):
         self.particle_tags = particle_tags
@@ -31,6 +33,16 @@ class GChords(object):
         self.particle_tracks = particle_tracks['xv']
         self.particle_indices = particle_tracks['particle_index']
         self.index_to_pos = particle_tracks['mapping'].item()
+
+    def set_circular_energy_radius(self, circ_er):
+        '''
+        Store the host's circular energy-radius table as self.circEr (a dict of arrays).
+
+        circ_er: path to the npz written by SymphonyPotential.circular_energy_radius(), or the dict it returns.
+        '''
+        if isinstance(circ_er, (str, os.PathLike)):
+            circ_er = np.load(circ_er)
+        self.circEr = dict(circ_er)
 
     def set_particle_pool(self, files):
         '''
