@@ -23,6 +23,9 @@ class GChords(object):
         self.pool_files = None
         self.pool_boundaries = None
         self.circEr = None
+        self.particle_tracks = None
+        self.particle_energies = None
+        self.circular_tidal_field = None
 
     def set_particle_tags(self, particle_tags):
         self.particle_tags = particle_tags
@@ -33,6 +36,8 @@ class GChords(object):
         self.particle_tracks = particle_tracks['xv']
         self.particle_indices = particle_tracks['particle_index']
         self.index_to_pos = particle_tracks['mapping'].item()
+        # specific energy in km^2/s^2 (None for particles.npz files written before energies were tracked)
+        self.particle_energies = particle_tracks['energy'] if 'energy' in particle_tracks else None
 
     def set_circular_energy_radius(self, circ_er):
         '''
@@ -246,11 +251,22 @@ class GChords(object):
 
     
 
-    def track_clusters(self, comoving=False, write_dir='particles.npz'):
+    def track_clusters(self, comoving=False, write_dir='particles.npz', energy=True):
+        '''
+        Tracks the tagged particles' host-centric phase-space coordinates (xv, shape (n_snapshots, n_tracked, 6))
+        from their infall snapshot on, and writes them to write_dir.
+
+        energy: if True, also saves each tracked particle's specific energy E = |v|^2 / 2 + U in km^2/s^2 (shape
+            (n_snapshots, n_tracked), NaN before infall), where U is the host's spherical particle potential from
+            potential.host_potential_at -- the same U as in SymphonyPotential.circular_energy_radius, so E can be
+            compared directly with its E_circ. Needs comoving=False, and reads all host particles at every snapshot.
+        '''
         # TODO: add capability to track from a_form snapshot.
         if self.particle_tags is None:
             raise ValueError("No particle tags found. Run generate_clusters() first.")
-        
+        if energy and comoving:
+            raise ValueError("Particle energies need physical units: use comoving=False or energy=False.")
+
         n_tracked_particles = len(self.particle_tags)
         indices = self.find_unique_particles()
 
@@ -264,6 +280,7 @@ class GChords(object):
         data = np.zeros((len(self.interface.scale_factors), n_tracked_particles, 6)) * np.nan
         unique_particle_tags = self.particle_tags.drop_duplicates(subset="particle_index")
         first_infall_snapshot = int(self.particle_tags["infall_snap"].min())
+        E = np.full(data.shape[:2], np.nan) if energy else None
 
         for snapshot in tqdm(range(first_infall_snapshot, len(self.interface.scale_factors)), desc="Tracking particles across snapshots..."):
             # Load all the subhalos at a given snapshot and their corresponding particles
@@ -284,10 +301,22 @@ class GChords(object):
                     i_t = self.particle_tags["particle_index"][ok]
                     data[snapshot, ok, :3] = p_flat[i_t]["x"]
                     data[snapshot, ok, 3:] = p_flat[i_t]["v"]
-        
+
+                if energy:
+                    rows = np.flatnonzero(ok.values)
+                    p_host = self.interface.particles.read(snapshot, mode="all", halo=0)
+                    U = potential.host_potential_at(
+                        self.interface.params, p_host["x"], p_host["ok"], data[snapshot, rows, :3]
+                    )
+                    E[snapshot, rows] = np.sum(data[snapshot, rows, 3:]**2, axis=1) / 2 + U
+
         self.particle_tracks = data
         self.particle_indices = indices
-        np.savez_compressed(write_dir, xv=data, particle_index=indices, mapping=self.index_to_pos)
+        out = dict(xv=data, particle_index=indices, mapping=self.index_to_pos)
+        if energy:
+            self.particle_energies = E
+            out["energy"] = E
+        np.savez_compressed(write_dir, **out)
 
     def find_unique_particles(self):
         if self.particle_tags is None:
@@ -349,12 +378,73 @@ class GChords(object):
             particle_index=self.particle_indices,
         )
 
-    def compute_cluster_masses(self, tidal_data, mass_loss_model, write_dir='particles_evolved.csv', integrated=False):
+    def compute_cluster_circular_tidal_field(self, write_dir='circular_tidal_field.npz'):
+        '''
+        For each tracked particle at each snapshot, the radius R_c of the circular orbit with the particle's energy,
+        and the tidal strength (Gyr^-2) of the host's spherically-averaged potential there.
+
+        Needs particle energies (track_clusters(energy=True) or set_particle_tracks) and the host's circular
+        energy-radius table (set_circular_energy_radius; SymphonyPotential.circular_energy_radius), whose E_circ
+        uses the same potential as the particle energies. At each snapshot the table's particles are sorted
+        separately in E_circ and in r and matched by rank, which makes E_circ(r) monotonic; R_c is interpolated in
+        log r at the particle's E, and the tidal strength (ordered by r) in log-log at R_c. Energies outside the
+        table are clamped to its innermost / outermost radius. Snapshots the table does not cover are NaN.
+
+        Saves and returns a dict: r_circ, tidal_strength_circ (n_snapshots, n_tracked), time (n_snapshots; Agama
+        units, as in compute_cluster_tidal_field), particle_index.
+        '''
+        if self.particle_energies is None:
+            raise ValueError("No particle energies found. Run track_clusters(energy=True) first.")
+        if self.circEr is None:
+            raise ValueError("No circular energy-radius table found. Run set_circular_energy_radius() first.")
+
+        E = self.particle_energies
+        r_circ = np.full(E.shape, np.nan)
+        ts_circ = np.full(E.shape, np.nan)
+
+        for j, snapshot in enumerate(tqdm(self.circEr["snapshots"], desc="Finding circular orbit radii...")):
+            rows = np.flatnonzero(np.isfinite(E[snapshot]))
+            r_tab = self.circEr["r"][j]
+            Ec_tab = self.circEr["E_circ"][j]
+            ts_tab = self.circEr["tidal_strength"][j]
+            good = np.isfinite(r_tab) & np.isfinite(Ec_tab) & np.isfinite(ts_tab) & (r_tab > 0) & (ts_tab > 0)
+            if len(rows) == 0 or np.sum(good) < 2:
+                continue
+            order = np.argsort(r_tab[good])
+            log_r = np.log(r_tab[good][order])
+            log_ts = np.log(ts_tab[good][order])
+            Ec = np.sort(Ec_tab[good])
+            log_rc = np.interp(E[snapshot, rows], Ec, log_r)
+            r_circ[snapshot, rows] = np.exp(log_rc)
+            ts_circ[snapshot, rows] = np.exp(np.interp(log_rc, log_r, log_ts))
+
+        time = self.interface.cosmology.age(1 / self.interface.scale_factors - 1) / 0.97779222
+        out = dict(r_circ=r_circ, tidal_strength_circ=ts_circ, time=time, particle_index=self.particle_indices)
+        np.savez_compressed(write_dir, **out)
+        self.circular_tidal_field = out
+        return out
+
+    def compute_cluster_masses(self, tidal_data, mass_loss_model, write_dir='particles_evolved.csv', integrated=False,
+                               circular_tidal_data=None):
         '''
         Compute the evolved masses of star clusters over time
 
         integrated: if True, `st` is time-integrated tidal strength and passes the MassLossModel `integrated` flag.
+        circular_tidal_data: output of compute_cluster_circular_tidal_field (dict or npz), needed by mass loss
+            models with requires_circular_tidal_field (e.g. CircularOrbitMassLossModel); defaults to the one
+            computed in this session.
         '''
+        needs_circ = getattr(mass_loss_model, "requires_circular_tidal_field", False)
+        if needs_circ:
+            if integrated:
+                raise ValueError("integrated=True is not available for models that need the circular tidal field.")
+            circ = circular_tidal_data if circular_tidal_data is not None else getattr(self, "circular_tidal_field", None)
+            if circ is None:
+                raise ValueError("This mass loss model needs circular_tidal_data "
+                                 "(run compute_cluster_circular_tidal_field() first).")
+            circ_t = np.asarray(circ["time"])
+            circ_ts = np.asarray(circ["tidal_strength_circ"])
+
         self.particle_tags["evolved_mass"] = np.zeros(len(self.particle_tags))
 
         if integrated:
@@ -374,7 +464,11 @@ class GChords(object):
                     # integrated=True path's `_int_st.append(0.0)` sentinel.
                     self.particle_tags["evolved_mass"].values[i] = self.particle_tags["gc_mass"].values[i]
                     continue
-                self.particle_tags["evolved_mass"].values[i] = mass_loss_model.evolve_mass(initial_mass=self.particle_tags["gc_mass"].values[i], time=t_i, tidal_strength=st_i, integrated=False)
+                extra = {}
+                if needs_circ:
+                    pos = self.index_to_pos[self.particle_tags["particle_index"].values[i]]
+                    extra = dict(circular_time=circ_t, circular_tidal_strength=circ_ts[:, pos])
+                self.particle_tags["evolved_mass"].values[i] = mass_loss_model.evolve_mass(initial_mass=self.particle_tags["gc_mass"].values[i], time=t_i, tidal_strength=st_i, integrated=False, **extra)
 
         self.particle_tags.to_csv(write_dir, index=False)
 

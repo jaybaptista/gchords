@@ -158,3 +158,116 @@ class MamikonyanMassLossModel(MassLossModel):
         )
 
         return float(np.clip(sol.y[0][-1], 0.0, None))
+
+
+class CircularOrbitRelaxationMassLossModel(RelaxationMassLossModel):
+    r"""
+    Relaxation-driven mass loss in the Gieles & Baumgardt (2008) form, with the tidal frequency replaced by an
+    effective one that interpolates between the cluster's own tidal field and that of the circular orbit with the
+    same energy:
+
+        \dot{M}/M = - \tilde{\omega}(t) / (\sqrt{2} A_GB) * (\ln(\gamma M / \bar{m}) / (M / M_sun))^{3/4}
+        \tilde{\omega}(t) = \omega_circ(t, E) * (\omega(t) / \omega_circ(t, E))^k
+
+    with omega = sqrt(tidal strength) in Gyr^-1 along the cluster's orbit, and omega_circ = sqrt(tidal strength) of
+    the circular orbit at the radius R_c(E, t) whose circular energy equals the cluster's energy E (see
+    GChords.compute_cluster_circular_tidal_field). k = 1 recovers the instantaneous tidal field, k = 0 the circular
+    orbit's. A_GB ~ 10^-0.55 and k ~ 2 are fit from N-body simulations.
+    """
+    def __init__(self, A_GB=10**-0.55, k=2.0, gamma=0.02, m_bar=0.5):
+        self.A_GB = A_GB
+        self.k = k
+        self.gamma = gamma
+        self.m_bar = m_bar
+
+    def omega_tilde(self, omega, omega_circ):
+        return omega_circ**(1 - self.k) * omega**self.k
+
+    def mass_loss_rate(self, cluster_mass, omega, omega_circ):
+        # dM/dt in Msun / Gyr for omega, omega_circ in Gyr^-1
+        if omega <= 0 or omega_circ <= 0:
+            return 0.0
+        return self._mass_loss_rate(cluster_mass, omega, omega_circ)
+
+    def _mass_loss_rate(self, m_cl, omega, omega_circ):
+        log_n = np.log(self.gamma * m_cl / self.m_bar)
+        if m_cl <= 0 or log_n <= 0:
+            return 0.0
+        return -m_cl * self.omega_tilde(omega, omega_circ) / (np.sqrt(2) * self.A_GB) * (log_n / m_cl)**0.75
+
+
+class CircularOrbitMassLossModel(MassLossModel):
+    r"""
+    Mass loss from CircularOrbitRelaxationMassLossModel (no stellar evolution).
+
+    The equation is separable, dM / (M^{1/4} \ln(\gamma M/\bar{m})^{3/4}) = -\tilde{\omega}(t) dt / (\sqrt{2} A_GB),
+    so M(t) is found exactly by inverting
+        F(M) = \int_{\bar{m}/\gamma}^{M} dm / (m^{1/4} \ln(\gamma m/\bar{m})^{3/4})
+             = 4 (\bar{m}/\gamma)^{3/4} \int_0^{w} e^{3 w'^4 / 4} dw',   w = \ln(\gamma M/\bar{m})^{1/4},
+    i.e. F(M(t)) = F(M_0) - X(t) / (\sqrt{2} A_GB) with X(t) = \int \tilde{\omega} dt (dimensionless). The cluster
+    has dissolved (mass 0) once F reaches 0, i.e. at M = \bar{m}/\gamma where the Coulomb logarithm vanishes.
+
+    evolve_mass needs the circular-orbit tidal strength at the cluster's tracked snapshots (circular_time,
+    circular_tidal_strength; from GChords.compute_cluster_circular_tidal_field), which is interpolated linearly in
+    log(tidal strength) onto the orbit's time samples. Times are in Agama units (as written by
+    compute_cluster_tidal_field) and converted with time_unit_gyr; tidal strengths are in Gyr^-2.
+    """
+    requires_circular_tidal_field = True
+
+    def __init__(self, A_GB=10**-0.55, k=2.0, gamma=0.02, m_bar=0.5, time_unit_gyr=0.97779222, m_max=1e10,
+                 n_table=20001):
+        super().__init__(
+            relaxation_model=CircularOrbitRelaxationMassLossModel(A_GB=A_GB, k=k, gamma=gamma, m_bar=m_bar),
+            stellar_evolution_model=NoStellarEvolutionModel(),
+        )
+        self.time_unit_gyr = time_unit_gyr
+        self.m_dissolve = m_bar / gamma
+        # F tabulated on w = ln(gamma M / m_bar)^(1/4), where the integrand 4 e^{3 w^4 / 4} is smooth
+        from scipy.integrate import cumulative_simpson
+        self._w = np.linspace(0.0, np.log(m_max / self.m_dissolve)**0.25, n_table)
+        self._F = self.m_dissolve**0.75 * cumulative_simpson(4 * np.exp(0.75 * self._w**4), x=self._w, initial=0.0)
+
+    def F(self, m):
+        m = np.asarray(m, dtype=float)
+        w = np.log(np.maximum(m, self.m_dissolve) / self.m_dissolve)**0.25
+        return np.interp(w, self._w, self._F)
+
+    def F_inverse(self, F):
+        w = np.interp(F, self._F, self._w)
+        return self.m_dissolve * np.exp(w**4)
+
+    def omega_tilde(self, time, tidal_strength, circular_time, circular_tidal_strength):
+        '''omega_tilde (Gyr^-1) at the orbit's time samples.'''
+        lam = np.clip(np.asarray(tidal_strength, dtype=float), 0.0, None)
+        t_c = np.asarray(circular_time, dtype=float)
+        lam_c = np.asarray(circular_tidal_strength, dtype=float)
+        ok = np.isfinite(t_c) & np.isfinite(lam_c) & (lam_c > 0)
+        if not np.any(ok):
+            # no circular-orbit information (e.g. no circular table at these snapshots): fall back to omega
+            return np.sqrt(lam)
+        lam_c = np.exp(np.interp(time, t_c[ok], np.log(lam_c[ok])))
+        return self.relaxation_model.omega_tilde(np.sqrt(lam), np.sqrt(lam_c))
+
+    def evolve_mass(self, initial_mass, time, tidal_strength, integrated=False, circular_time=None,
+                    circular_tidal_strength=None):
+        '''
+        Mass at time[-1] of a cluster of initial_mass at time[0].
+
+        integrated=True: tidal_strength is X = \int omega_tilde dt (dimensionless, time in Gyr), and initial_mass
+        and X may be arrays. Otherwise time / tidal_strength are the orbit's samples (Agama time units, Gyr^-2) and
+        circular_time / circular_tidal_strength the circular-orbit tidal strength at its snapshots.
+        '''
+        if integrated:
+            X = np.asarray(tidal_strength, dtype=float)
+        else:
+            if circular_time is None or circular_tidal_strength is None:
+                raise ValueError("CircularOrbitMassLossModel needs circular_time and circular_tidal_strength "
+                                 "(see GChords.compute_cluster_circular_tidal_field).")
+            time = np.asarray(time, dtype=float)
+            g = self.omega_tilde(time, tidal_strength, circular_time, circular_tidal_strength)
+            X = np.trapz(g, time) * self.time_unit_gyr
+
+        m0 = np.asarray(initial_mass, dtype=float)
+        F_t = self.F(m0) - X / (np.sqrt(2) * self.relaxation_model.A_GB)
+        m = np.where((F_t > 0) & (m0 > self.m_dissolve), self.F_inverse(np.maximum(F_t, 0.0)), 0.0)
+        return float(m) if m.ndim == 0 else m

@@ -11,6 +11,84 @@ def agama_times(cosmology, scale_factors):
     # cosmic age at each scale factor in Agama internal time units (~0.97779222 Gyr)
     return cosmology.age(1/np.asarray(scale_factors) - 1) / 0.97779222
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Spherical (Einasto / NFW) profile fits, ported from the old mwgcs package (getConvergenceRadius in mwgcs/interface.py
+# and SymphonyHaloProfile in mwgcs/fit.py) via energy_sorting/test_inner_extrapolation.ipynb.
+# ---------------------------------------------------------------------------------------------------------------------
+
+PROFILE_UNTRACKED, PROFILE_EINASTO, PROFILE_NFW = -1, 0, 1
+
+def host_potential_at(params, x_host, ok_host, x):
+    '''
+    Potential (km^2/s^2) at host-centric positions x (physical kpc) of the spherical host potential used by
+    SymphonyPotential.circular_energy_radius: symlib.profile_info's potential of the valid host particles, with its
+    PE / vmax**2 scaling and its 4 G M / R_out outer boundary term (should be G M / R_out) undone.
+
+    The positions x are passed to profile_info as zero-mass particles alongside the host particles, so U(x) follows
+    exactly the same discretisation (and eps softening) as the host particles' own U. The corrected U is independent
+    of where the outer boundary R_out falls, so positions beyond every host particle get -G M_tot / r. Rows of x with
+    NaNs are returned as NaN.
+    '''
+    x = np.atleast_2d(x)
+    U = np.full(len(x), np.nan)
+    good = np.all(np.isfinite(x), axis=1)
+    if not np.any(good) or np.sum(ok_host) == 0:
+        return U
+    x_all = np.concatenate([x_host, x[good]])
+    ok_all = np.concatenate([ok_host, np.zeros(np.sum(good), dtype=bool)])
+    _, vmax, pe, _ = symlib.profile_info(params, x_all, ok_all)
+    r_out = np.sqrt(np.nanmax(np.linalg.norm(x_all, axis=1))**2 + params['eps']**2)
+    mp = params['mp'] / params['h100']
+    U[good] = pe[len(x_host):] * vmax**2 + 3 * agama.G * np.sum(ok_host) * mp / r_out
+    return U
+
+def get_convergence_radius(params, a):
+    '''max(0.055 x mean interparticle spacing, 3 eps), both in physical kpc, at scale factor a.'''
+    H0 = params["h100"] * 3.2407792894443648e-18  # 1/s
+    _G = 4.517103049894965e-39  # kpc^3 / Msun / s^2
+    rho_m = params["Om0"] * (3 / (8 * np.pi * _G)) * H0**2
+    l_0 = (params["mp"] / params["h100"] / rho_m) ** (1 / 3)
+    return np.max((5.5e-2 * a * l_0, 3 * params["eps"] / params["h100"] * a))
+
+def get_density_profile(r, mp, rvir, bins=50):
+    '''Density in `bins` equal-count radial bins of the particles inside rvir; bin radius is the mean particle radius.'''
+    _r = np.sort(r[r < rvir])
+    bin_r = np.array_split(_r, bins)
+    bin_edges = np.concatenate([[0], [b[-1] for b in bin_r]])  # rightmost particle of each bin
+    bin_volume = (4 * np.pi / 3) * (bin_edges[1:]**3 - bin_edges[:-1]**3)
+    # number of particles with edge[i] <= r < edge[i+1] (as in mwgcs, the outermost particle is dropped)
+    bin_count = np.diff(np.searchsorted(_r, bin_edges, side='left'))
+    bin_radius = np.array([np.mean(b) for b in bin_r])
+    return bin_radius, mp * bin_count / bin_volume
+
+def einasto_log_density(r, alpha, Rs, logScaleDensity):
+    '''log10 Einasto density (Gao+2008 / Gao+2014 parametrisation); Rs is r_-2 and 10**logScaleDensity is rho(r_-2).'''
+    # https://ui.adsabs.harvard.edu/abs/2014MNRAS.444..222G/abstract; A cancels, kept for parity with mwgcs
+    A = 1.715 * (alpha ** (-0.00183)) * (alpha + 0.0817) ** (-0.179488)
+    Rmax = A * Rs
+    return logScaleDensity - (2 / alpha) * (((A * r) / Rmax) ** alpha - 1) / np.log(10)
+
+def nfw_log_density(r, Rs, logScaleDensity):
+    '''log10 NFW density, with Rs = r_-2 and 10**logScaleDensity = rho(r_-2) = rho_0 / 4, as for einasto_log_density.'''
+    x = r / Rs
+    return logScaleDensity + np.log10(4 / (x * (1 + x)**2))
+
+def nfw_from_mass(m, rvir, c):
+    '''(Rs, log10 rho(Rs)) of the NFW profile with M(<rvir) = m and concentration c = rvir / Rs.'''
+    Rs = rvir / c
+    rho_0 = m / (4 * np.pi * Rs**3 * (np.log(1 + c) - c / (1 + c)))
+    return Rs, np.log10(rho_0 / 4)
+
+def fit_einasto(r, mp, rvir, r_conv, bins=50, p0=(0.18, 10, 5), bounds=((0.175, 0.01, 1.0), (0.185, 50., 10.)),
+                maxfev=1000):
+    '''Fits einasto_log_density to the binned density of radii r beyond r_conv. Returns (alpha, Rs, logScaleDensity).'''
+    from scipy.optimize import curve_fit
+    radii, rho = get_density_profile(r, mp, rvir, bins)
+    mask = (radii > r_conv) & (rho > 0)
+    popt, _ = curve_fit(einasto_log_density, radii[mask], np.log10(rho[mask]), p0=p0, bounds=bounds, maxfev=maxfev,
+                        nan_policy="omit")
+    return popt, np.sum(mask)
+
 class Potential(ABC):
     def __init__(self, interface, write_dir):
         self.interface = interface
@@ -137,8 +215,19 @@ class SymphonyPotential(AgamaPotential):
             for f in os.listdir(self.write_dir) if f.startswith('snap_') and f.endswith('.ini')
         )
 
-    def construct_potential(self, lmax, rmin=1e-2, rmax_rvir=1.2, nrad=25, mode='all', min_particles=100, symmetry='None', stride=1, overwrite=False):
+    def construct_potential(self, lmax, rmin=1e-2, rmax_rvir=1.2, nrad=25, mode='all', min_particles=100, symmetry='None', stride=1, overwrite=False,
+                            spherical_profile=False, spherical_profile_kwargs=None):
+        '''
+        Builds the host's evolving multipole potential in write_dir. If spherical_profile is True, also fits the
+        Einasto / NFW spherical approximation of every halo at every snapshot (SymphonyPotential.spherical_profile,
+        called with spherical_profile_kwargs) into write_dir/spherical_profile.npz -- this runs even when the
+        multipole potential already exists and is not rebuilt. An existing spherical_profile.npz is only recomputed
+        if spherical_profile_kwargs contains overwrite=True.
+        '''
         os.makedirs(self.write_dir, exist_ok=True)
+
+        if spherical_profile:
+            self.spherical_profile(**(spherical_profile_kwargs or {}))
 
         if self.potential_exists and not overwrite:
             print("Potential already exists. Use `overwrite=True` to reconstruct potential.")
@@ -307,6 +396,114 @@ class SymphonyPotential(AgamaPotential):
 
         out.update(snapshots=snapshots, scale_factor=self.interface.scale_factors[snapshots],
                    time=self._agama_times()[snapshots], r_target=r_target)
+        np.savez_compressed(path, **out)
+        return out
+
+    def spherical_profile(self, halos=None, snapshots=None, mode='all', bins=50, min_fit_particles=1000,
+                          min_fit_bins=5, p0=(0.18, 10, 5), bounds=((0.175, 0.01, 1.0), (0.185, 50., 10.)),
+                          maxfev=1000, rs_max_rvir=1.0, file_name='spherical_profile.npz', overwrite=False):
+        '''
+        Fits a spherical density profile to every halo (host = 0 and subhalos) at every snapshot and writes it to
+        write_dir/file_name.
+
+        For each tracked halo (rs['ok']), the valid particles it owns are centred on its Rockstar position, and an
+        Einasto profile is fit to the log density in `bins` equal-count radial bins of the particles inside its
+        Rockstar rvir, using only bins beyond the convergence radius (get_convergence_radius; the same for all halos
+        at a snapshot). This is the fit in energy_sorting/test_inner_extrapolation.ipynb (ported from mwgcs), except
+        that if rs_max_rvir is not None the upper bound on Rs is rs_max_rvir * rvir of that halo at that snapshot
+        instead of bounds[1][1] (a fixed 50 kpc pinned the late-time MWest hosts at the bound).
+
+        If the Einasto fit is not possible -- fewer than min_fit_particles valid particles between r_conv and rvir,
+        fewer than min_fit_bins bins beyond r_conv, or curve_fit fails -- the halo is instead given the NFW profile
+        with its Rockstar mass m inside rvir and concentration cvir. Untracked halos (not yet formed, or disrupted)
+        are NaN.
+
+        params[..., :] = (alpha, Rs, log10_rho_s). For both profiles Rs is r_-2 (the radius where dlog rho / dlog r
+        = -2) in physical kpc, and rho_s = rho(r_-2) in Msun / kpc^3 (for NFW this is rho_0 / 4); alpha is NaN for
+        NFW. Evaluate with einasto_log_density(r, *params) or nfw_log_density(r, *params[1:]) according to
+        profile_type.
+
+        Returns a dict of the saved arrays:
+            params (n_halos, n_snapshots, 3), profile_type (n_halos, n_snapshots; PROFILE_UNTRACKED = -1,
+            PROFILE_EINASTO = 0, PROFILE_NFW = 1), n_fit_bins and n_fit_particles (n_halos, n_snapshots; bins /
+            particles beyond r_conv used or available for the Einasto fit), hit_bounds (Einasto fit ended on a bound
+            of Rs or log10_rho_s), halos (n_halos), snapshots, scale_factor, time (n_snapshots; Agama units),
+            r_conv (n_snapshots), m, rvir, cvir (n_halos, n_snapshots; Rockstar), param_names.
+        '''
+        path = os.path.join(self.write_dir, file_name)
+        if os.path.exists(path) and not overwrite:
+            print(f"{path} already exists. Use `overwrite=True` to recompute it.")
+            return dict(np.load(path))
+        os.makedirs(self.write_dir, exist_ok=True)
+
+        rs, params, mp = self.interface.rs, self.interface.params, self.interface.mp
+        halos = np.arange(rs.shape[0]) if halos is None else np.asarray(halos, dtype=int)
+        if snapshots is None:
+            snapshots = np.arange(len(self.interface.scale_factors))
+        snapshots = np.asarray(snapshots, dtype=int)
+        shape = (len(halos), len(snapshots))
+
+        out_params = np.full(shape + (3,), np.nan)
+        profile_type = np.full(shape, PROFILE_UNTRACKED, dtype=np.int8)
+        n_fit_bins = np.zeros(shape, dtype=int)
+        n_fit_particles = np.zeros(shape, dtype=int)
+        hit_bounds = np.zeros(shape, dtype=bool)
+        r_conv_snap = np.array([get_convergence_radius(params, self.interface.scale_factors[s]) for s in snapshots])
+        lo_b, hi_b = np.asarray(bounds[0], dtype=float), np.asarray(bounds[1], dtype=float)
+
+        for j, snapshot in enumerate(tqdm(snapshots, desc="Fitting spherical profiles...")):
+            tracked = rs['ok'][halos, snapshot]
+            if not np.any(tracked):
+                continue
+            # 'all' / 'current' modes read every halo at once anyway
+            p_all = self.interface.particles.read(snapshot, mode=mode)
+            r_conv = r_conv_snap[j]
+
+            for i in np.flatnonzero(tracked):
+                h = halos[i]
+                rvir = rs['rvir'][h, snapshot]
+                p = p_all[h]
+                r = np.linalg.norm(p['x'][p['ok']] - rs['x'][h, snapshot], axis=1)
+                n_out = np.sum((r > r_conv) & (r < rvir))
+                n_fit_particles[i, j] = n_out
+                lo_h, hi_h = lo_b.copy(), hi_b.copy()
+                if rs_max_rvir is not None:
+                    hi_h[1] = rs_max_rvir * rvir
+
+                popt = None
+                if n_out >= min_fit_particles:
+                    # halo-scaled starting point, inside the bounds
+                    m_in = mp * np.sum(r < rvir)
+                    guess = np.clip([p0[0], 0.2 * rvir, np.log10(m_in / (4 * np.pi * (0.2 * rvir)**3))],
+                                    lo_h + 1e-6 * (hi_h - lo_h), hi_h - 1e-6 * (hi_h - lo_h))
+                    try:
+                        popt, nb = fit_einasto(r, mp, rvir, r_conv, bins=bins, p0=guess,
+                                               bounds=(lo_h, hi_h), maxfev=maxfev)
+                        n_fit_bins[i, j] = nb
+                        if nb < min_fit_bins or not np.all(np.isfinite(popt)):
+                            popt = None
+                    except (RuntimeError, ValueError, TypeError):
+                        popt = None
+
+                if popt is not None:
+                    out_params[i, j] = popt
+                    profile_type[i, j] = PROFILE_EINASTO
+                    tol = 1e-3 * (hi_h[1:] - lo_h[1:])
+                    hit_bounds[i, j] = np.any((popt[1:] - lo_h[1:] < tol) | (hi_h[1:] - popt[1:] < tol))
+                else:
+                    Rs, log_rho_s = nfw_from_mass(rs['m'][h, snapshot], rvir, rs['cvir'][h, snapshot])
+                    out_params[i, j] = (np.nan, Rs, log_rho_s)
+                    profile_type[i, j] = PROFILE_NFW
+
+        m = np.where(profile_type != PROFILE_UNTRACKED, rs['m'][halos][:, snapshots], np.nan)
+        rvir = np.where(profile_type != PROFILE_UNTRACKED, rs['rvir'][halos][:, snapshots], np.nan)
+        cvir = np.where(profile_type != PROFILE_UNTRACKED, rs['cvir'][halos][:, snapshots], np.nan)
+        out = dict(params=out_params, profile_type=profile_type, n_fit_bins=n_fit_bins,
+                   n_fit_particles=n_fit_particles, hit_bounds=hit_bounds, halos=halos, snapshots=snapshots,
+                   scale_factor=self.interface.scale_factors[snapshots], time=self._agama_times()[snapshots],
+                   r_conv=r_conv_snap, m=m, rvir=rvir, cvir=cvir,
+                   param_names=np.array(['alpha', 'Rs', 'log10_rho_s']),
+                   rs_max_rvir=np.nan if rs_max_rvir is None else rs_max_rvir)
         np.savez_compressed(path, **out)
         return out
 
