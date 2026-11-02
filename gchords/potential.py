@@ -156,6 +156,213 @@ def fit_einasto(r, mp, rvir, r_conv, bins=50, p0=(0.18, 10, 5), bounds=((0.175, 
                         nan_policy="omit")
     return popt, np.sum(mask)
 
+def fit_spherical_halo(r, mp, rvir, m_rockstar, cvir_rockstar, r_conv, bins=50, min_fit_particles=1000,
+                       min_fit_bins=5, p0=(0.18, 10, 5), bounds=((0.05, 0.01, 1.0), (1.0, 50., 12.)), maxfev=5000,
+                       rs_max_rvir=1.0, binning='log', min_bin_count=20, bound_fallback=True):
+    '''
+    Einasto fit (with NFW fallback) of one halo's particles at radii r (physical kpc, about the halo centre), as
+    described in SymphonyPotential.spherical_profile, which calls it for every halo and snapshot. m_rockstar and
+    cvir_rockstar are the halo's Rockstar mass and concentration, used for the NFW fallback.
+
+    Returns a dict: params (alpha, Rs, log10_rho_s; alpha NaN for NFW), profile_type (PROFILE_EINASTO or
+    PROFILE_NFW), n_fit_bins, n_fit_particles, hit_bounds, fallback_reason, einasto_params (every completed Einasto
+    fit, including rejected ones, NaN otherwise).
+    '''
+    lo_h, hi_h = np.array(bounds[0], dtype=float), np.array(bounds[1], dtype=float)
+    if rs_max_rvir is not None:
+        hi_h[1] = rs_max_rvir * rvir
+
+    n_out = np.sum((r > r_conv) & (r < rvir))
+    out = dict(n_fit_bins=0, n_fit_particles=n_out, hit_bounds=False, fallback_reason=FALLBACK_NONE,
+               einasto_params=np.full(3, np.nan))
+
+    popt, reason = None, FALLBACK_FEW_PARTICLES
+    if n_out >= min_fit_particles:
+        # halo-scaled starting point, inside the bounds
+        m_in = mp * np.sum(r < rvir)
+        guess = np.clip([p0[0], 0.2 * rvir, np.log10(m_in / (4 * np.pi * (0.2 * rvir)**3))],
+                        lo_h + 1e-6 * (hi_h - lo_h), hi_h - 1e-6 * (hi_h - lo_h))
+        try:
+            popt, nb = fit_einasto(r, mp, rvir, r_conv, bins=bins, p0=guess, bounds=(lo_h, hi_h), maxfev=maxfev,
+                                   binning=binning, min_bin_count=min_bin_count)
+            out['n_fit_bins'] = nb
+            if not np.all(np.isfinite(popt)):
+                popt, reason = None, FALLBACK_FIT_FAILED
+            elif nb < min_fit_bins:
+                popt, reason = None, FALLBACK_FEW_BINS
+        except (RuntimeError, ValueError, TypeError):
+            popt, reason = None, FALLBACK_FIT_FAILED
+
+    if popt is not None:
+        out['einasto_params'] = popt
+        tol = 1e-3 * (hi_h - lo_h)
+        at_lo, at_hi = popt - lo_h < tol, hi_h - popt < tol
+        out['hit_bounds'] = np.any(at_lo | at_hi)
+        # Rs = rs_max_rvir * rvir only means no density turnover inside rvir; the curve is still
+        # constrained by the particles in the fit range, so it is kept as Einasto
+        if rs_max_rvir is not None:
+            at_hi[1] = False
+        if bound_fallback and np.any(at_lo | at_hi):
+            popt, reason = None, FALLBACK_AT_BOUND
+
+    if popt is not None:
+        out.update(params=np.asarray(popt, dtype=float), profile_type=PROFILE_EINASTO)
+    else:
+        Rs, log_rho_s = nfw_from_mass(m_rockstar, rvir, cvir_rockstar)
+        out.update(params=np.array([np.nan, Rs, log_rho_s]), profile_type=PROFILE_NFW, fallback_reason=reason)
+    return out
+
+def profile_log_density(r, params, profile_type):
+    '''log10 density of a fit_spherical_halo / spherical_profile fit (PROFILE_EINASTO or PROFILE_NFW).'''
+    if profile_type == PROFILE_EINASTO:
+        return einasto_log_density(r, *params)
+    if profile_type == PROFILE_NFW:
+        return nfw_log_density(r, *params[1:])
+    raise ValueError(f"profile_type must be PROFILE_EINASTO or PROFILE_NFW, got {profile_type}.")
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Subhalo models: how SymphonyPotential.construct_potential_subhalo represents the material bound to each subhalo.
+# ---------------------------------------------------------------------------------------------------------------------
+
+class SubhaloModel(ABC):
+    '''
+    How a subhalo's bound particles are turned into its own potential at one snapshot.
+
+    construct_potential_subhalo calls build() once per subhalo and snapshot, with the subhalo's bound particles
+    centred on its Rockstar position; the returned agama potential is exported, and all of a subhalo's snapshots
+    are joined into an Evolving potential that follows the subhalo's trajectory. build() returns None if the
+    subhalo cannot be represented at that snapshot (its particles then stay in the host).
+    '''
+
+    def __init__(self, min_particles=100):
+        # subhalos with fewer bound particles are left in the host potential
+        self.min_particles = min_particles
+
+    @abstractmethod
+    def build(self, x, mp, props):
+        '''
+        x: (N, 3) bound-particle positions about the subhalo centre (physical kpc); mp: particle mass (Msun);
+        props: dict with the subhalo's Rockstar rvir, m, cvir at this snapshot, the convergence radius r_conv, and
+        halo / snapshot indices. Returns an agama.Potential or None.
+        '''
+
+    @abstractmethod
+    def describe(self):
+        '''dict of the model's settings, written next to the potential.'''
+
+
+class SphericalSubhaloModel(SubhaloModel):
+    '''
+    Spherical fit (fit_spherical_halo: Einasto, falling back to the Rockstar NFW) of each subhalo's bound particles,
+    with the same defaults as SymphonyPotential.spherical_profile. The fit is evaluated as an l = 0 agama Multipole
+    whose density is smoothly truncated, rho(r) * exp(-(r / r_t)**cutoff_strength), since neither profile has a
+    finite mass.
+
+    truncation='bound_mass' (default) picks r_t so that the truncated profile's total mass equals the bound
+    particles' mass (searched in [truncation_range[0], truncation_range[1]] * rvir, clipped to that range if no r_t
+    there matches), so the material taken out of the host is all put back in the subhalo and the fitted inner profile
+    is kept. truncation='rvir' uses r_t = truncation_rvir * rvir instead (the total mass then differs from the bound
+    mass). fit_kwargs are passed to fit_spherical_halo.
+    '''
+
+    def __init__(self, min_particles=100, truncation='bound_mass', truncation_rvir=1.0, truncation_range=(0.05, 100.),
+                 cutoff_strength=2.0, rmin=1e-3, rmax_trunc=5.0, nrad=25, **fit_kwargs):
+        super().__init__(min_particles=min_particles)
+        if truncation not in ('bound_mass', 'rvir'):
+            raise ValueError("truncation must be 'bound_mass' or 'rvir'.")
+        self.truncation = truncation
+        self.truncation_rvir = truncation_rvir
+        self.truncation_range = tuple(truncation_range)
+        self.cutoff_strength = cutoff_strength
+        self.rmin = rmin
+        self.rmax_trunc = rmax_trunc
+        self.nrad = nrad
+        self.fit_kwargs = fit_kwargs
+
+    def _truncated_mass(self, params, ptype, r_t, rvir):
+        # 4 pi int rho(r) exp(-(r/r_t)^cs) r^2 dr on a log grid well past r_t
+        r = np.logspace(np.log10(self.rmin * 1e-2), np.log10(max(r_t, rvir) * 30), 2000)
+        rho = 10**profile_log_density(r, params, ptype) * np.exp(-(r / r_t)**self.cutoff_strength)
+        trapezoid = getattr(np, "trapezoid", None) or np.trapz
+        return trapezoid(4 * np.pi * rho * r**3, np.log(r))
+
+    def truncation_radius(self, params, ptype, m_bound, rvir):
+        '''r_t for these fit params (see the class docstring).'''
+        if self.truncation == 'rvir':
+            return self.truncation_rvir * rvir
+        from scipy.optimize import brentq
+        lo, hi = self.truncation_range[0] * rvir, self.truncation_range[1] * rvir
+        f = lambda log_rt: np.log(self._truncated_mass(params, ptype, np.exp(log_rt), rvir) / m_bound)
+        f_lo, f_hi = f(np.log(lo)), f(np.log(hi))
+        if f_lo >= 0:
+            return lo
+        if f_hi <= 0:
+            return hi
+        return np.exp(brentq(f, np.log(lo), np.log(hi), xtol=1e-4))
+
+    def build(self, x, mp, props):
+        r = np.linalg.norm(x, axis=1)
+        fit = fit_spherical_halo(r, mp, props['rvir'], props['m'], props['cvir'], props['r_conv'], **self.fit_kwargs)
+        params, ptype = fit['params'], fit['profile_type']
+        if not np.all(np.isfinite(params[1:])) or params[1] <= 0:
+            return None
+        r_t = self.truncation_radius(params, ptype, mp * len(x), props['rvir'])
+        cs = self.cutoff_strength
+
+        def density(xyz):
+            rr = np.maximum(np.linalg.norm(np.atleast_2d(xyz), axis=1), 1e-12)
+            return 10**profile_log_density(rr, params, ptype) * np.exp(-(rr / r_t)**cs)
+
+        return agama.Potential(type='Multipole', density=density, lmax=0, symmetry='spherical', rmin=self.rmin,
+                               rmax=self.rmax_trunc * r_t, gridSizeR=self.nrad)
+
+    def describe(self):
+        return dict(type='spherical', min_particles=self.min_particles, truncation=self.truncation,
+                    truncation_rvir=self.truncation_rvir, truncation_range=self.truncation_range,
+                    cutoff_strength=self.cutoff_strength, rmin=self.rmin, rmax_trunc=self.rmax_trunc, nrad=self.nrad,
+                    **self.fit_kwargs)
+
+
+class MultipoleSubhaloModel(SubhaloModel):
+    '''
+    Multipole expansion of order lmax of each subhalo's bound particles (as the host in construct_potential), on a
+    radial grid from rmin to max(rmax_rvir * rvir, the outermost bound particle). symmetry defaults to 'spherical'
+    for lmax = 0 and 'None' otherwise.
+    '''
+
+    def __init__(self, lmax=2, min_particles=100, rmin=1e-3, rmax_rvir=1.2, nrad=25, symmetry=None):
+        super().__init__(min_particles=min_particles)
+        self.lmax = lmax
+        self.rmin = rmin
+        self.rmax_rvir = rmax_rvir
+        self.nrad = nrad
+        self.symmetry = symmetry if symmetry is not None else ('spherical' if lmax == 0 else 'None')
+
+    def build(self, x, mp, props):
+        rmax = max(self.rmax_rvir * props['rvir'], np.max(np.linalg.norm(x, axis=1)))
+        return agama.Potential(type='Multipole', symmetry=self.symmetry, lmax=self.lmax, rmin=self.rmin, rmax=rmax,
+                               gridSizeR=self.nrad, particles=(x, mp * np.ones(len(x))))
+
+    def describe(self):
+        return dict(type='multipole', lmax=self.lmax, min_particles=self.min_particles, rmin=self.rmin,
+                    rmax_rvir=self.rmax_rvir, nrad=self.nrad, symmetry=self.symmetry)
+
+
+SUBHALO_MODELS = {'spherical': SphericalSubhaloModel, 'multipole': MultipoleSubhaloModel}
+
+def subhalo_model_from_spec(spec):
+    '''
+    SubhaloModel from a config dict such as {'type': 'multipole', 'lmax': 2}: 'type' picks the class
+    (SUBHALO_MODELS), the remaining keys are its constructor arguments. None returns None (no subhalos).
+    '''
+    if spec is None:
+        return None
+    spec = dict(spec)
+    kind = spec.pop('type', None)
+    if kind not in SUBHALO_MODELS:
+        raise ValueError(f"subhalo model type must be one of {sorted(SUBHALO_MODELS)}, got {kind!r}.")
+    return SUBHALO_MODELS[kind](**spec)
+
 class Potential(ABC):
     def __init__(self, interface, write_dir):
         self.interface = interface
@@ -198,13 +405,14 @@ class AgamaPotential(Potential):
         
         x = np.atleast_2d(x)
         N = len(x)
-        
+
         if np.isscalar(t):
             t = np.full(N, t)
         elif len(t) != N:
             raise ValueError("Length of time array must match number of positions.")
 
-        d = np.array([self.phi.eval(x_i, der=True, t=t_i) for x_i, t_i in zip(x, t)])
+        # one vectorised call (agama accepts a per-point t), identical to evaluating point by point
+        d = np.atleast_2d(self.phi.eval(x, der=True, t=np.asarray(t, dtype=float)))
 
         d2phidx2  = d[:, 0]
         d2phidy2  = d[:, 1]
@@ -259,6 +467,8 @@ class SymphonyPotential(AgamaPotential):
         return True
 
     def _snapshot_files_in_potential(self, potential_ini):
+        # every file listed under a Timestamps block, in all [Potential ...] sections (construct_potential writes
+        # one section, construct_potential_subhalo one per halo)
         files = []
         in_timestamps = False
 
@@ -268,11 +478,11 @@ class SymphonyPotential(AgamaPotential):
                 if line == 'Timestamps':
                     in_timestamps = True
                     continue
-                if not in_timestamps:
+                if not line or line.startswith('['):
+                    in_timestamps = False
                     continue
-                if not line:
-                    break
-                files.append(line.split()[1])
+                if in_timestamps:
+                    files.append(line.split()[1])
 
         return files
 
@@ -539,7 +749,6 @@ class SymphonyPotential(AgamaPotential):
         fallback_reason = np.zeros(shape, dtype=np.int8)
         einasto_params = np.full(shape + (3,), np.nan)
         r_conv_snap = np.array([get_convergence_radius(params, self.interface.scale_factors[s]) for s in snapshots])
-        lo_b, hi_b = np.asarray(bounds[0], dtype=float), np.asarray(bounds[1], dtype=float)
 
         for j, snapshot in enumerate(tqdm(snapshots, desc="Fitting spherical profiles...")):
             tracked = rs['ok'][halos, snapshot]
@@ -554,50 +763,18 @@ class SymphonyPotential(AgamaPotential):
                 rvir = rs['rvir'][h, snapshot]
                 p = p_all[h]
                 r = np.linalg.norm(p['x'][p['ok']] - rs['x'][h, snapshot], axis=1)
-                n_out = np.sum((r > r_conv) & (r < rvir))
-                n_fit_particles[i, j] = n_out
-                lo_h, hi_h = lo_b.copy(), hi_b.copy()
-                if rs_max_rvir is not None:
-                    hi_h[1] = rs_max_rvir * rvir
-
-                popt, reason = None, FALLBACK_FEW_PARTICLES
-                if n_out >= min_fit_particles:
-                    # halo-scaled starting point, inside the bounds
-                    m_in = mp * np.sum(r < rvir)
-                    guess = np.clip([p0[0], 0.2 * rvir, np.log10(m_in / (4 * np.pi * (0.2 * rvir)**3))],
-                                    lo_h + 1e-6 * (hi_h - lo_h), hi_h - 1e-6 * (hi_h - lo_h))
-                    try:
-                        popt, nb = fit_einasto(r, mp, rvir, r_conv, bins=bins, p0=guess,
-                                               bounds=(lo_h, hi_h), maxfev=maxfev, binning=binning,
-                                               min_bin_count=min_bin_count)
-                        n_fit_bins[i, j] = nb
-                        if not np.all(np.isfinite(popt)):
-                            popt, reason = None, FALLBACK_FIT_FAILED
-                        elif nb < min_fit_bins:
-                            popt, reason = None, FALLBACK_FEW_BINS
-                    except (RuntimeError, ValueError, TypeError):
-                        popt, reason = None, FALLBACK_FIT_FAILED
-
-                if popt is not None:
-                    einasto_params[i, j] = popt
-                    tol = 1e-3 * (hi_h - lo_h)
-                    at_lo, at_hi = popt - lo_h < tol, hi_h - popt < tol
-                    hit_bounds[i, j] = np.any(at_lo | at_hi)
-                    # Rs = rs_max_rvir * rvir only means no density turnover inside rvir; the curve is still
-                    # constrained by the particles in the fit range, so it is kept as Einasto
-                    if rs_max_rvir is not None:
-                        at_hi[1] = False
-                    if bound_fallback and np.any(at_lo | at_hi):
-                        popt, reason = None, FALLBACK_AT_BOUND
-
-                if popt is not None:
-                    out_params[i, j] = popt
-                    profile_type[i, j] = PROFILE_EINASTO
-                else:
-                    fallback_reason[i, j] = reason
-                    Rs, log_rho_s = nfw_from_mass(rs['m'][h, snapshot], rvir, rs['cvir'][h, snapshot])
-                    out_params[i, j] = (np.nan, Rs, log_rho_s)
-                    profile_type[i, j] = PROFILE_NFW
+                fit = fit_spherical_halo(
+                    r, mp, rvir, rs['m'][h, snapshot], rs['cvir'][h, snapshot], r_conv, bins=bins,
+                    min_fit_particles=min_fit_particles, min_fit_bins=min_fit_bins, p0=p0, bounds=bounds,
+                    maxfev=maxfev, rs_max_rvir=rs_max_rvir, binning=binning, min_bin_count=min_bin_count,
+                    bound_fallback=bound_fallback)
+                out_params[i, j] = fit['params']
+                profile_type[i, j] = fit['profile_type']
+                n_fit_bins[i, j] = fit['n_fit_bins']
+                n_fit_particles[i, j] = fit['n_fit_particles']
+                hit_bounds[i, j] = fit['hit_bounds']
+                fallback_reason[i, j] = fit['fallback_reason']
+                einasto_params[i, j] = fit['einasto_params']
 
         m = np.where(profile_type != PROFILE_UNTRACKED, rs['m'][halos][:, snapshots], np.nan)
         rvir = np.where(profile_type != PROFILE_UNTRACKED, rs['rvir'][halos][:, snapshots], np.nan)
@@ -613,18 +790,206 @@ class SymphonyPotential(AgamaPotential):
         np.savez_compressed(path, **out)
         return out
 
-    def construct_potential_subhalo(self, halo_index, lmax, rmin=1e-2, rmax_rvir=1.2, nrad=25, mode='all', min_particles=100, symmetry='None', stride=1, overwrite=False):
+    def construct_potential_subhalo(self, subhalo_model, lmax, rmin=1e-2, rmax_rvir=1.2, nrad=25, mode='all',
+                                    min_particles=100, symmetry='None', snapshots=None, overwrite=False):
+        '''
+        Like construct_potential, but the material bound to each subhalo gets its own potential instead of being
+        part of the host's multipole.
+
+        At each snapshot, every subhalo that has fallen into the host (snapshot >= first_infall_snap) and is still
+        tracked by Rockstar has its valid particles cut to those bound to it (is_bound, about its Rockstar position
+        and velocity). A particle bound to several (nested) subhalos is given to the one with the fewest bound
+        particles. Subhalos with at least subhalo_model.min_particles bound particles are represented by
+        subhalo_model.build() (e.g. SphericalSubhaloModel, MultipoleSubhaloModel), centred on the subhalo, and written
+        to write_dir/subhalos/halo_<i>/snap_<k>.ini. The host is the same multipole as in construct_potential (lmax,
+        rmin, rmax_rvir, nrad, symmetry, min_particles) of the host's valid particles minus those subhalo
+        potentials' particles -- i.e. its smoothly accreted particles plus everything stripped from subhalos -- and is
+        written to write_dir/snap_<k>.ini.
+
+        potential.ini then joins them in the layout of the BFE full_cosmo.dat potentials: an Evolving [Potential
+        halo_0] for the host and an Evolving [Potential halo_<i>] per subhalo, whose center follows
+        subhalos/traj_<i>.txt (t, x, y, z, vx, vy, vz: the Rockstar host-centric position and velocity, linearly
+        extrapolated past disruption). Each subhalo's timestamps are bracketed by null.ini (zero mass) at the
+        snapshots before its first and after its last potential, so it ramps on and off over one snapshot; snapshots
+        inside that range with no potential (too few bound particles) are interpolated across. The model settings
+        are written to subhalo_model.json.
+
+        Construction resumes after a failure like construct_potential (the host file of each snapshot is written
+        last, and the last snapshot found is rebuilt). overwrite=True deletes this directory's snap_*.ini and
+        subhalos/ first. snapshots restricts construction to those snapshots (default: all; mainly for testing).
+        '''
+        import json
+        import shutil
+
+        if mode not in ('all', 'current'):
+            raise ValueError("construct_potential_subhalo needs mode='all' or 'current' (every halo is read).")
         os.makedirs(self.write_dir, exist_ok=True)
 
-        # check if it does exist 
-        subhalo_potential_exists = False
-
-        if subhalo_potential_exists and not overwrite:
+        if self.potential_exists and not overwrite:
             print("Potential already exists. Use `overwrite=True` to reconstruct potential.")
-            return 
-        
-        
-            
+            return
+
+        sub_dir = os.path.join(self.write_dir, 'subhalos')
+        n_snap = len(self.interface.scale_factors)
+        snapshots = np.arange(n_snap) if snapshots is None else np.unique(np.asarray(snapshots, dtype=int))
+
+        if overwrite:
+            for k in self._existing_snapshot_numbers():
+                os.remove(os.path.join(self.write_dir, f'snap_{k}.ini'))
+            shutil.rmtree(sub_dir, ignore_errors=True)
+            start = snapshots[0]
+        else:
+            existing = self._existing_snapshot_numbers()
+            start = snapshots[0]
+            if existing:
+                start = existing[-1]
+                print(f"Found an incomplete potential -- resuming construction from snapshot {start}, which is "
+                      f"regenerated in case it was left corrupted by a previous failed run.")
+                os.remove(os.path.join(self.write_dir, f'snap_{start}.ini'))
+                # subhalo files of the snapshot being redone (and any later) are rewritten too
+                for k, f in self._subhalo_snapshot_files(sub_dir):
+                    if k >= start:
+                        os.remove(f)
+
+        rs, params, mp = self.interface.rs, self.interface.params, self.interface.mp
+        first_infall = np.asarray(self.interface.hist['first_infall_snap'])
+        n_halo = rs.shape[0]
+        n_min = subhalo_model.min_particles
+
+        for snapshot in tqdm(snapshots[snapshots >= start], desc="Constructing host + subhalo potentials..."):
+            p_all = self.interface.particles.read(snapshot, mode=mode)
+            host = p_all[0]
+            if np.sum(host['ok']) < min_particles:
+                continue
+            r_conv = get_convergence_radius(params, self.interface.scale_factors[snapshot])
+
+            # bound particles of every subhalo inside the host
+            ids, xs, owner = [], [], []
+            for i in range(1, n_halo):
+                if not (rs['ok'][i, snapshot] and 0 <= first_infall[i] <= snapshot):
+                    continue
+                p = p_all[i]
+                ok = p['ok']
+                if np.sum(ok) < n_min:
+                    continue
+                b = is_bound(p['x'][ok], p['v'][ok], rs['x'][i, snapshot], rs['v'][i, snapshot], params)
+                if np.sum(b) < n_min:
+                    continue
+                ids.append(p['id'][ok][b])
+                xs.append(p['x'][ok][b])
+                owner.append(np.full(np.sum(b), i))
+
+            claimed = []
+            if ids:
+                ids, xs, owner = np.concatenate(ids), np.concatenate(xs), np.concatenate(owner)
+                # a particle bound to several subhalos goes to the one with the fewest bound particles
+                n_bound = np.bincount(owner, minlength=n_halo)[owner]
+                order = np.lexsort((owner, n_bound, ids))
+                ids, xs, owner = ids[order], xs[order], owner[order]
+                first = np.ones(len(ids), dtype=bool)
+                first[1:] = ids[1:] != ids[:-1]
+                ids, xs, owner = ids[first], xs[first], owner[first]
+
+                for i in np.unique(owner):
+                    sel = owner == i
+                    if np.sum(sel) < n_min:
+                        continue
+                    props = dict(rvir=rs['rvir'][i, snapshot], m=rs['m'][i, snapshot], cvir=rs['cvir'][i, snapshot],
+                                 r_conv=r_conv, halo=int(i), snapshot=int(snapshot))
+                    pot = subhalo_model.build(xs[sel] - rs['x'][i, snapshot], mp, props)
+                    if pot is None:
+                        continue
+                    d = os.path.join(sub_dir, f'halo_{i}')
+                    os.makedirs(d, exist_ok=True)
+                    pot.export(os.path.join(d, f'snap_{snapshot}.ini'))
+                    claimed.append(ids[sel])
+
+            # host: valid host particles not represented by a subhalo potential
+            in_host = host['ok']
+            if claimed:
+                in_host = in_host & ~np.isin(host['id'], np.concatenate(claimed))
+            x = host['x'][in_host]
+            if len(x) < min_particles:
+                continue
+
+            potential = agama.Potential(
+                type='Multipole',
+                symmetry=symmetry,
+                lmax=lmax,
+                rmin=rmin,
+                rmax=rmax_rvir * self.interface.rs["rvir"][0, snapshot],
+                gridSizeR=nrad,
+                particles=(x, mp * np.ones(len(x)))
+            )
+            # written last, so its presence marks the snapshot as complete for resuming
+            potential.export(os.path.join(self.write_dir, f'snap_{snapshot}.ini'))
+
+        self._write_subhalo_potential_ini(sub_dir)
+        with open(os.path.join(self.write_dir, 'subhalo_model.json'), 'w') as f:
+            json.dump(dict(subhalo_model=subhalo_model.describe(),
+                           host=dict(lmax=lmax, rmin=rmin, rmax_rvir=rmax_rvir, nrad=nrad, mode=mode,
+                                     min_particles=min_particles, symmetry=symmetry)), f, indent=2, default=str)
+
+        self.phi = agama.Potential(file=os.path.join(self.write_dir, 'potential.ini'))
+        self.potential_exists = True
+
+    @staticmethod
+    def _subhalo_snapshot_files(sub_dir):
+        '''(snapshot, path) of every subhalos/halo_<i>/snap_<k>.ini.'''
+        out = []
+        if not os.path.isdir(sub_dir):
+            return out
+        for d in os.listdir(sub_dir):
+            if not d.startswith('halo_'):
+                continue
+            for f in os.listdir(os.path.join(sub_dir, d)):
+                if f.startswith('snap_') and f.endswith('.ini'):
+                    out.append((int(f[5:-4]), os.path.join(sub_dir, d, f)))
+        return out
+
+    def _write_subhalo_potential_ini(self, sub_dir):
+        '''Writes null.ini, subhalos/traj_<i>.txt and the composite potential.ini of construct_potential_subhalo.'''
+        rs = self.interface.rs
+        t = self._agama_times()
+        last = len(self.interface.scale_factors) - 1
+
+        with open(os.path.join(self.write_dir, 'null.ini'), 'w') as f:
+            f.write("[Potential]\ntype=Plummer\nmass=0.\nscaleRadius=1.\n")
+
+        lines = ["[Potential halo_0]", "type=Evolving", "interpLinear=True", "Timestamps"]
+        lines += [f"{t[k]} snap_{k}.ini" for k in self._existing_snapshot_numbers()]
+        lines.append("")
+
+        by_halo = {}
+        for k, path in self._subhalo_snapshot_files(sub_dir):
+            by_halo.setdefault(int(os.path.basename(os.path.dirname(path))[5:]), []).append(k)
+
+        for i in sorted(by_halo):
+            S = sorted(by_halo[i])
+            rows = ([(S[0] - 1, 'null.ini')] if S[0] > 0 else []) + \
+                   [(k, f'subhalos/halo_{i}/snap_{k}.ini') for k in S] + \
+                   ([(S[-1] + 1, 'null.ini')] if S[-1] < last else [])
+
+            traj = []
+            for k, _ in rows:
+                if rs['ok'][i, k]:
+                    x, v = rs['x'][i, k], rs['v'][i, k]
+                else:
+                    # past disruption: continue in a straight line from the nearest snapshot with a potential
+                    kk = S[np.argmin(np.abs(np.array(S) - k))]
+                    v = rs['v'][i, kk]
+                    x = rs['x'][i, kk] + v * (t[k] - t[kk])  # km/s * (kpc / (km/s)) time units
+                traj.append(f"{t[k]} " + " ".join(f"{c:.9g}" for c in np.concatenate([x, v])))
+            with open(os.path.join(sub_dir, f'traj_{i}.txt'), 'w') as f:
+                f.write("\n".join(traj) + "\n")
+
+            lines += [f"[Potential halo_{i}]", "type=Evolving", "interpLinear=True", f"center=subhalos/traj_{i}.txt",
+                      "Timestamps"]
+            lines += [f"{t[k]} {name}" for k, name in rows]
+            lines.append("")
+
+        with open(os.path.join(self.write_dir, 'potential.ini'), 'w') as f:
+            f.write("\n".join(lines) + "\n")
 
 def is_bound(q, p, subhalo_pos, subhalo_vel, params):
     dq = q - subhalo_pos
