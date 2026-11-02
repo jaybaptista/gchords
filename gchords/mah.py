@@ -16,7 +16,7 @@ These functions are approximations for the halo growth rate taken from Fakhouri+
 These are used to model the evolution of the GC-halo connection for some classes in `sampler.py`
 '''
 
-def dmdz_mean(z, m):
+def dmdz_mean(z, m, Om=0.286, Olam=(1-0.286)):
     a = 46.1 * (m/1e12)**(1.1) * (1 + 1.11*z)
     rad = np.sqrt(0.286 * (1+z)**3 + (1 - 0.286))
     dtdz = cosmo.age(z, derivative=1)
@@ -42,7 +42,11 @@ def mean_mah(m0, zmax=20, z_eval=None):
 
 # Median rates
 def dmdz_median(z, m):
-    a = 25.3 * (m/1e12)**(1.1) * (1 + 1.65*z)
+    # The median from Fakhouri+2010 is slightly different from the mean and is given by the following formula.
+    # a = 25.3 * (m/1e12)**(1.1) * (1 + 1.65*z)
+    # We have to recalibrate this to the c125-c048 box in order to reproduce the median
+    # mass accretion histories of halos in the Symphony parent box:
+    a = 27.08 * (m/1e12)**(1.09) * (1 + 2.8*z)
     rad = np.sqrt(0.286 * (1+z)**3 + (1 - 0.286))
     dtdz = cosmo.age(z, derivative=1)
     return [a * rad * dtdz * 1e9]

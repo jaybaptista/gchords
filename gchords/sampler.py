@@ -57,7 +57,7 @@ class KruijssenAgeModel(AgeModel):
         z_grid = table[:, 0]
         pdf_z  = table[:, 1]
 
-        # convert z → cosmic time; z increases → t decreases, so reverse
+        # convert z => cosmic time; z increases => t decreases, so reverse
         t_grid = np.array([cosmo.age(z) for z in z_grid])
         dtdz   = np.abs(np.gradient(t_grid, z_grid))   # |dt/dz|
 
@@ -389,7 +389,7 @@ class DornanOccupationModelInSitu(OccupationModel):
     """
     In-situ variant of DornanOccupationModel.
 
-    Builds an interpolator over (log_mhalo, lookback_time) → p_gc by tracing
+    Builds an interpolator over (log_mhalo, lookback_time) => p_gc by tracing
     each halo's mean MAH and anchoring p_gc to the z=0 peak halo mass via the
     Dornan logistic relation.
     """
@@ -611,7 +611,7 @@ class GCSDornanMixture(GCSMassModel):
         scatter=0.3,
         masses=None,
         z_eval=None,
-        z_form_weight=False,
+        z_form_weight=True,
         age_model=None,
         seed=None,
     ):
