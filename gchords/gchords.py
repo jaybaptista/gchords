@@ -8,10 +8,14 @@ from gchords.sampler import ValcinAgeModel
 from gchords import potential
 
 class GChords(object):
-    def __init__(self, interface, gc_halo_model, age_model=None, **kwargs):
+    def __init__(
+        self, interface, gc_halo_model, age_model=None, feh_model=None, **kwargs
+    ):
         self.interface = interface
         self.gc_halo_model = gc_halo_model
         self.age_model = age_model if age_model is not None else ValcinAgeModel()
+        # None => use [Fe/H] of the tagged star particle
+        self.feh_model = feh_model
         self.particle_tags = None
         # particle tagging with Nimbus
         self.weights, _, _ = symlib.tag_stars(
@@ -213,7 +217,11 @@ class GChords(object):
 
             p_draw = mp / np.sum(mp)
             draws = np.random.choice(len(mp), size=len(_mgcs), replace=False, p=p_draw)
-            feh = self.weights[k]['Fe_H'][draws]
+            if self.feh_model is None:
+                feh = self.weights[k]["Fe_H"][draws]
+            else:
+                feh = self.feh_model.sample(len(_mgcs))
+            # tracer age is not a GC age prediction; AgeModel only sets the GC-halo normalization
             a_form = self.weights[k]['a_form'][draws]
 
             rows.append(

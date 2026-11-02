@@ -118,6 +118,41 @@ class ValcinAgeModel(AgeModel):
         return self._dist.cdf(np.clip(t, 0, self._tmax))
 
 
+class FeHModel(abc.ABC):
+    """
+    Base class for GC metallicity ([Fe/H]) distributions.
+
+    If no FeHModel is given to GChords, [Fe/H] is taken from the tagged star particle.
+    """
+
+    @abc.abstractmethod
+    def var_names(self):
+        pass
+
+    @abc.abstractmethod
+    def sample(self, n_draws, **kwargs):
+        """Draw n_draws [Fe/H] values."""
+        pass
+
+
+class FiducialFeHModel(FeHModel):
+    """
+    Gaussian [Fe/H] distribution, MCMC posterior medians for the 58 accreted
+    Milky Way GCs (accreted_Rgc_w_mass_prog.csv matched to mwgc_clusters_feh.csv;
+    see gchords_modeling/mwgcs/fit_feh.ipynb).
+    """
+
+    def __init__(self, mu=-1.627, sigma=0.417):
+        self.mu = mu
+        self.sigma = sigma
+
+    def var_names(self):
+        return ["mu", "sigma"]
+
+    def sample(self, n_draws, **kwargs):
+        return np.random.normal(self.mu, self.sigma, size=n_draws)
+
+
 """
 Mass-to-light ratios are taken from N-body modeling of globular clusters:
 https://arxiv.org/abs/1609.08794
