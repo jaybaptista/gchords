@@ -26,6 +26,7 @@ class GChords(object):
         self.particle_tracks = None
         self.particle_energies = None
         self.circular_tidal_field = None
+        self.spherical_profile = None
 
     def set_particle_tags(self, particle_tags):
         self.particle_tags = particle_tags
@@ -318,6 +319,31 @@ class GChords(object):
             out["energy"] = E
         np.savez_compressed(write_dir, **out)
 
+    def compute_particle_energies(self, write_dir=None):
+        '''
+        Specific energies (km^2/s^2) of already-tracked particles, for tracks loaded with set_particle_tracks from a
+        particles.npz written before track_clusters saved energies. Same definition as track_clusters(energy=True):
+        E = |v|^2 / 2 + potential.host_potential_at, from the tracks' host-centric physical xv (track_clusters'
+        default comoving=False). Reads all host particles at every snapshot with a tracked particle.
+
+        Stores self.particle_energies (n_snapshots, n_tracked; NaN where untracked) and, if write_dir is given, saves
+        it with particle_index. Returns the array.
+        '''
+        if self.particle_tracks is None:
+            raise ValueError("No particle tracks found. Run track_clusters() or set_particle_tracks() first.")
+        xv = self.particle_tracks
+        E = np.full(xv.shape[:2], np.nan)
+        snaps = np.flatnonzero(np.any(np.isfinite(xv[:, :, 0]), axis=1))
+        for snapshot in tqdm(snaps, desc="Computing particle energies..."):
+            rows = np.flatnonzero(np.isfinite(xv[snapshot, :, 0]))
+            p_host = self.interface.particles.read(snapshot, mode="all", halo=0)
+            U = potential.host_potential_at(self.interface.params, p_host["x"], p_host["ok"], xv[snapshot, rows, :3])
+            E[snapshot, rows] = np.sum(xv[snapshot, rows, 3:]**2, axis=1) / 2 + U
+        self.particle_energies = E
+        if write_dir is not None:
+            np.savez_compressed(write_dir, energy=E, particle_index=self.particle_indices)
+        return E
+
     def find_unique_particles(self):
         if self.particle_tags is None:
             raise ValueError("No particle tags found. Run generate_clusters() first.")
@@ -378,48 +404,128 @@ class GChords(object):
             particle_index=self.particle_indices,
         )
 
-    def compute_cluster_circular_tidal_field(self, write_dir='circular_tidal_field.npz'):
+    def set_spherical_profile(self, sph):
+        '''
+        Store the halos' spherical (Einasto / NFW) fits as self.spherical_profile (a dict of arrays); the host
+        (halo 0) fit is used inside the convergence radius by compute_cluster_circular_tidal_field.
+
+        sph: path to the npz written by SymphonyPotential.spherical_profile(), or the dict it returns.
+        '''
+        if isinstance(sph, (str, os.PathLike)):
+            sph = np.load(sph)
+        self.spherical_profile = dict(sph)
+
+    def circular_table(self, snapshot, use_profile=True, n_inner=200, r_inner_min=1e-4):
+        '''
+        The host's circular-orbit table at one snapshot, as used by compute_cluster_circular_tidal_field:
+        (r, E_circ, tidal_strength, r_conv, profile_type), with r increasing and E_circ non-decreasing, or None if
+        the snapshot has no usable table.
+
+        Outside the convergence radius r_conv it is the particle table from circular_energy_radius, with the
+        table's particles sorted separately in E_circ and in r and matched by rank (so E_circ(r) is monotonic) and
+        the tidal strength ordered by r. If use_profile is True and the host has a spherical_profile fit at this
+        snapshot, everything at r <= r_conv is instead the fit's (profile_circular): its tidal strength, and its
+        E_circ shifted by a constant so that it equals the particle table's (interpolated in log r) at r_conv. The
+        fit is sampled on n_inner log-spaced radii from min(r_inner_min, r_conv / 1e3) to r_conv. If the host has
+        no fit here, or use_profile is False, the particle table is used at every radius (r_conv and
+        profile_type are then NaN and PROFILE_UNTRACKED).
+        '''
+        j = np.flatnonzero(np.asarray(self.circEr["snapshots"]) == snapshot)
+        if len(j) == 0:
+            return None
+        j = j[0]
+        r_tab = self.circEr["r"][j]
+        Ec_tab = self.circEr["E_circ"][j]
+        ts_tab = self.circEr["tidal_strength"][j]
+        good = np.isfinite(r_tab) & np.isfinite(Ec_tab) & np.isfinite(ts_tab) & (r_tab > 0) & (ts_tab > 0)
+        if np.sum(good) < 2:
+            return None
+        order = np.argsort(r_tab[good])
+        r = r_tab[good][order]
+        ts = ts_tab[good][order]
+        Ec = np.sort(Ec_tab[good])
+
+        r_conv, ptype = np.nan, potential.PROFILE_UNTRACKED
+        if use_profile:
+            sph = self.spherical_profile
+            k = np.flatnonzero(np.asarray(sph["snapshots"]) == snapshot)
+            h = np.flatnonzero(np.asarray(sph["halos"]) == 0)
+            if len(k) and len(h):
+                k, h = k[0], h[0]
+                ptype = int(sph["profile_type"][h, k])
+                params = sph["params"][h, k]
+                r_conv = float(sph["r_conv"][k])
+                ok = ptype != potential.PROFILE_UNTRACKED and np.all(np.isfinite(params[1:])) and r_conv > 0
+                if not ok:
+                    r_conv, ptype = np.nan, potential.PROFILE_UNTRACKED
+
+        if ptype != potential.PROFILE_UNTRACKED:
+            r_in = np.logspace(np.log10(min(r_inner_min, r_conv / 1e3)), np.log10(r_conv), n_inner)
+            Ec_in, ts_in = potential.profile_circular(r_in, params, ptype)
+            # match the fit's E_circ to the particle table's at r_conv
+            Ec_in += np.interp(np.log(r_conv), np.log(r), Ec) - Ec_in[-1]
+            out = r > r_conv
+            r = np.concatenate([r_in, r[out]])
+            Ec = np.concatenate([Ec_in, Ec[out]])
+            ts = np.concatenate([ts_in, ts[out]])
+
+        return r, Ec, ts, r_conv, ptype
+
+    def compute_cluster_circular_tidal_field(self, write_dir='circular_tidal_field.npz', use_profile=True,
+                                             n_inner=200, r_inner_min=1e-4):
         '''
         For each tracked particle at each snapshot, the radius R_c of the circular orbit with the particle's energy,
         and the tidal strength (Gyr^-2) of the host's spherically-averaged potential there.
 
-        Needs particle energies (track_clusters(energy=True) or set_particle_tracks) and the host's circular
+        Needs particle energies (track_clusters(energy=True) or set_particle_tracks), the host's circular
         energy-radius table (set_circular_energy_radius; SymphonyPotential.circular_energy_radius), whose E_circ
-        uses the same potential as the particle energies. At each snapshot the table's particles are sorted
-        separately in E_circ and in r and matched by rank, which makes E_circ(r) monotonic; R_c is interpolated in
-        log r at the particle's E, and the tidal strength (ordered by r) in log-log at R_c. Energies outside the
-        table are clamped to its innermost / outermost radius. Snapshots the table does not cover are NaN.
+        uses the same potential as the particle energies, and, if use_profile is True, the halos' spherical fits
+        (set_spherical_profile; SymphonyPotential.spherical_profile).
 
-        Saves and returns a dict: r_circ, tidal_strength_circ (n_snapshots, n_tracked), time (n_snapshots; Agama
-        units, as in compute_cluster_tidal_field), particle_index.
+        The particle table cannot be trusted inside the convergence radius, so there both E_circ(r) and the tidal
+        strength come from the host's Einasto / NFW fit, with the fit's E_circ matched to the particle table at
+        r_conv (see circular_table). R_c is interpolated in log r at the particle's E, and the tidal strength in
+        log-log at R_c. Energies outside the table are clamped to its innermost / outermost radius. Snapshots the
+        table does not cover are NaN; snapshots without a host fit use the particle table at all radii.
+
+        Saves and returns a dict: r_circ, tidal_strength_circ, inside_r_conv (R_c <= r_conv, so both came from the
+        fit) (n_snapshots, n_tracked); r_conv, host_profile_type (n_snapshots; NaN / PROFILE_UNTRACKED where the
+        fit was not used); time (n_snapshots; Agama units, as in compute_cluster_tidal_field); particle_index.
         '''
         if self.particle_energies is None:
             raise ValueError("No particle energies found. Run track_clusters(energy=True) first.")
         if self.circEr is None:
             raise ValueError("No circular energy-radius table found. Run set_circular_energy_radius() first.")
+        if use_profile and self.spherical_profile is None:
+            raise ValueError("No spherical profiles found. Run set_spherical_profile() first, "
+                             "or pass use_profile=False to use the particle table at every radius.")
 
         E = self.particle_energies
+        n_snap = E.shape[0]
         r_circ = np.full(E.shape, np.nan)
         ts_circ = np.full(E.shape, np.nan)
+        inside = np.zeros(E.shape, dtype=bool)
+        r_conv_snap = np.full(n_snap, np.nan)
+        ptype_snap = np.full(n_snap, potential.PROFILE_UNTRACKED, dtype=np.int8)
 
-        for j, snapshot in enumerate(tqdm(self.circEr["snapshots"], desc="Finding circular orbit radii...")):
+        for snapshot in tqdm(self.circEr["snapshots"], desc="Finding circular orbit radii..."):
             rows = np.flatnonzero(np.isfinite(E[snapshot]))
-            r_tab = self.circEr["r"][j]
-            Ec_tab = self.circEr["E_circ"][j]
-            ts_tab = self.circEr["tidal_strength"][j]
-            good = np.isfinite(r_tab) & np.isfinite(Ec_tab) & np.isfinite(ts_tab) & (r_tab > 0) & (ts_tab > 0)
-            if len(rows) == 0 or np.sum(good) < 2:
+            if len(rows) == 0:
                 continue
-            order = np.argsort(r_tab[good])
-            log_r = np.log(r_tab[good][order])
-            log_ts = np.log(ts_tab[good][order])
-            Ec = np.sort(Ec_tab[good])
-            log_rc = np.interp(E[snapshot, rows], Ec, log_r)
+            table = self.circular_table(snapshot, use_profile=use_profile, n_inner=n_inner, r_inner_min=r_inner_min)
+            if table is None:
+                continue
+            r, Ec, ts, r_conv, ptype = table
+            log_rc = np.interp(E[snapshot, rows], Ec, np.log(r))
             r_circ[snapshot, rows] = np.exp(log_rc)
-            ts_circ[snapshot, rows] = np.exp(np.interp(log_rc, log_r, log_ts))
+            ts_circ[snapshot, rows] = np.exp(np.interp(log_rc, np.log(r), np.log(ts)))
+            r_conv_snap[snapshot], ptype_snap[snapshot] = r_conv, ptype
+            if np.isfinite(r_conv):
+                inside[snapshot, rows] = r_circ[snapshot, rows] <= r_conv
 
         time = self.interface.cosmology.age(1 / self.interface.scale_factors - 1) / 0.97779222
-        out = dict(r_circ=r_circ, tidal_strength_circ=ts_circ, time=time, particle_index=self.particle_indices)
+        out = dict(r_circ=r_circ, tidal_strength_circ=ts_circ, inside_r_conv=inside, r_conv=r_conv_snap,
+                   host_profile_type=ptype_snap, time=time, particle_index=self.particle_indices)
         np.savez_compressed(write_dir, **out)
         self.circular_tidal_field = out
         return out

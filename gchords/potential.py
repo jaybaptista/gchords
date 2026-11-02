@@ -17,6 +17,8 @@ def agama_times(cosmology, scale_factors):
 # ---------------------------------------------------------------------------------------------------------------------
 
 PROFILE_UNTRACKED, PROFILE_EINASTO, PROFILE_NFW = -1, 0, 1
+# why spherical_profile used the NFW fallback instead of the Einasto fit
+FALLBACK_NONE, FALLBACK_FEW_PARTICLES, FALLBACK_FEW_BINS, FALLBACK_FIT_FAILED, FALLBACK_AT_BOUND = 0, 1, 2, 3, 4
 
 def host_potential_at(params, x_host, ok_host, x):
     '''
@@ -61,6 +63,17 @@ def get_density_profile(r, mp, rvir, bins=50):
     bin_radius = np.array([np.mean(b) for b in bin_r])
     return bin_radius, mp * bin_count / bin_volume
 
+def get_log_density_profile(r, mp, r_lo, r_hi, bins=50, min_count=20):
+    '''
+    Density in `bins` log-spaced radial bins between r_lo and r_hi, at the bins' geometric-centre radii, keeping
+    only bins with at least min_count particles. Returns (radius, density, count).
+    '''
+    edges = np.logspace(np.log10(r_lo), np.log10(r_hi), bins + 1)
+    count = np.histogram(r, edges)[0]
+    volume = (4 * np.pi / 3) * (edges[1:]**3 - edges[:-1]**3)
+    keep = count >= min_count
+    return np.sqrt(edges[1:] * edges[:-1])[keep], (mp * count / volume)[keep], count[keep]
+
 def einasto_log_density(r, alpha, Rs, logScaleDensity):
     '''log10 Einasto density (Gao+2008 / Gao+2014 parametrisation); Rs is r_-2 and 10**logScaleDensity is rho(r_-2).'''
     # https://ui.adsabs.harvard.edu/abs/2014MNRAS.444..222G/abstract; A cancels, kept for parity with mwgcs
@@ -79,11 +92,65 @@ def nfw_from_mass(m, rvir, c):
     rho_0 = m / (4 * np.pi * Rs**3 * (np.log(1 + c) - c / (1 + c)))
     return Rs, np.log10(rho_0 / 4)
 
+# Untruncated analytic mass, potential and density of the spherical_profile fits, in Msun, kpc, km^2/s^2 and
+# Msun/kpc^3. params = (alpha, Rs, log10_rho_s) as saved by spherical_profile (alpha unused for NFW).
+
+def einasto_mass(r, alpha, Rs, logScaleDensity):
+    from scipy.special import gamma, gammainc
+    t = 2 * (r / Rs)**alpha / alpha
+    norm = 4 * np.pi * 10**logScaleDensity * Rs**3 * np.exp(2 / alpha) * (alpha / 2)**(3 / alpha) / alpha
+    return norm * gamma(3 / alpha) * gammainc(3 / alpha, t)
+
+def einasto_potential(r, alpha, Rs, logScaleDensity):
+    from scipy.special import gamma, gammaincc
+    t = 2 * (r / Rs)**alpha / alpha
+    outer = 4 * np.pi * agama.G * 10**logScaleDensity * Rs**2 * np.exp(2 / alpha) * (alpha / 2)**(2 / alpha) / alpha
+    return -agama.G * einasto_mass(r, alpha, Rs, logScaleDensity) / r - outer * gamma(2 / alpha) * gammaincc(2 / alpha, t)
+
+def nfw_mass(r, Rs, logScaleDensity):
+    x = r / Rs
+    return 16 * np.pi * 10**logScaleDensity * Rs**3 * (np.log1p(x) - x / (1 + x))
+
+def nfw_potential(r, Rs, logScaleDensity):
+    return -16 * np.pi * agama.G * 10**logScaleDensity * Rs**3 * np.log1p(r / Rs) / r
+
+def profile_circular(r, params, profile_type):
+    '''
+    Circular-orbit energy E_circ(r) = Phi(r) + G M(<r) / (2 r) (km^2/s^2, Phi -> 0 at infinity) and tidal strength
+    max(|4 pi G rho - 2 G M / r^3|, G M / r^3) in Gyr^-2 -- the same definitions as
+    SymphonyPotential.circular_energy_radius -- of a spherical_profile fit (PROFILE_EINASTO or PROFILE_NFW).
+    '''
+    r = np.asarray(r, dtype=float)
+    alpha, Rs, log_rho = params
+    if profile_type == PROFILE_EINASTO:
+        M, phi = einasto_mass(r, alpha, Rs, log_rho), einasto_potential(r, alpha, Rs, log_rho)
+        rho = 10**einasto_log_density(r, alpha, Rs, log_rho)
+    elif profile_type == PROFILE_NFW:
+        M, phi, rho = nfw_mass(r, Rs, log_rho), nfw_potential(r, Rs, log_rho), 10**nfw_log_density(r, Rs, log_rho)
+    else:
+        raise ValueError(f"profile_type must be PROFILE_EINASTO or PROFILE_NFW, got {profile_type}.")
+    G = agama.G
+    lam_t = G * M / r**3
+    lam_r = 4 * np.pi * G * rho - 2 * G * M / r**3
+    return phi + G * M / (2 * r), np.maximum(np.abs(lam_r), np.abs(lam_t)) * 1.0459401725324529
+
 def fit_einasto(r, mp, rvir, r_conv, bins=50, p0=(0.18, 10, 5), bounds=((0.175, 0.01, 1.0), (0.185, 50., 10.)),
-                maxfev=1000):
-    '''Fits einasto_log_density to the binned density of radii r beyond r_conv. Returns (alpha, Rs, logScaleDensity).'''
+                maxfev=1000, binning='equal_count', min_bin_count=20):
+    '''
+    Fits einasto_log_density to the binned density of radii r beyond r_conv. Returns ((alpha, Rs, logScaleDensity),
+    number of bins used).
+
+    binning='equal_count' (mwgcs / the notebook): `bins` equal-count bins of all particles inside rvir, keeping those
+    beyond r_conv. For a well-resolved halo the innermost bin then reaches several r_conv, so nothing near r_conv
+    constrains the fit. binning='log': `bins` log-spaced bins from r_conv to rvir with >= min_bin_count particles.
+    '''
     from scipy.optimize import curve_fit
-    radii, rho = get_density_profile(r, mp, rvir, bins)
+    if binning == 'equal_count':
+        radii, rho = get_density_profile(r, mp, rvir, bins)
+    elif binning == 'log':
+        radii, rho, _ = get_log_density_profile(r, mp, r_conv, rvir, bins, min_bin_count)
+    else:
+        raise ValueError("binning must be 'equal_count' or 'log'.")
     mask = (radii > r_conv) & (rho > 0)
     popt, _ = curve_fit(einasto_log_density, radii[mask], np.log10(rho[mask]), p0=p0, bounds=bounds, maxfev=maxfev,
                         nan_policy="omit")
@@ -400,23 +467,40 @@ class SymphonyPotential(AgamaPotential):
         return out
 
     def spherical_profile(self, halos=None, snapshots=None, mode='all', bins=50, min_fit_particles=1000,
-                          min_fit_bins=5, p0=(0.18, 10, 5), bounds=((0.175, 0.01, 1.0), (0.185, 50., 10.)),
-                          maxfev=1000, rs_max_rvir=1.0, file_name='spherical_profile.npz', overwrite=False):
+                          min_fit_bins=5, p0=(0.18, 10, 5), bounds=((0.05, 0.01, 1.0), (1.0, 50., 12.)),
+                          maxfev=5000, rs_max_rvir=1.0, binning='log', min_bin_count=20, bound_fallback=True,
+                          file_name='spherical_profile.npz', overwrite=False):
         '''
         Fits a spherical density profile to every halo (host = 0 and subhalos) at every snapshot and writes it to
         write_dir/file_name.
 
         For each tracked halo (rs['ok']), the valid particles it owns are centred on its Rockstar position, and an
-        Einasto profile is fit to the log density in `bins` equal-count radial bins of the particles inside its
-        Rockstar rvir, using only bins beyond the convergence radius (get_convergence_radius; the same for all halos
-        at a snapshot). This is the fit in energy_sorting/test_inner_extrapolation.ipynb (ported from mwgcs), except
-        that if rs_max_rvir is not None the upper bound on Rs is rs_max_rvir * rvir of that halo at that snapshot
-        instead of bounds[1][1] (a fixed 50 kpc pinned the late-time MWest hosts at the bound).
+        Einasto profile is fit to the log density of its particles between the convergence radius r_conv
+        (get_convergence_radius; the same for all halos at a snapshot) and its Rockstar rvir, in `bins` log-spaced
+        radial bins with at least min_bin_count particles each (binning='log'). The fit is then used inside r_conv,
+        where the particles cannot be trusted, so it must be constrained near r_conv.
 
-        If the Einasto fit is not possible -- fewer than min_fit_particles valid particles between r_conv and rvir,
-        fewer than min_fit_bins bins beyond r_conv, or curve_fit fails -- the halo is instead given the NFW profile
-        with its Rockstar mass m inside rvir and concentration cvir. Untracked halos (not yet formed, or disrupted)
-        are NaN.
+        This differs from the fit in energy_sorting/test_inner_extrapolation.ipynb (ported from mwgcs), which is still
+        available with binning='equal_count', bounds=((0.175, 0.01, 1.0), (0.185, 50., 10.)), rs_max_rvir=None:
+          - mwgcs bins all particles inside rvir into equal-count bins and keeps those beyond r_conv. For a host with
+            ~10^6 particles the innermost bin then reaches ~5-8 kpc (several r_conv), so the fit is an extrapolation
+            near r_conv; its tidal strength just outside r_conv was ~2x too low at late times for MWest Halo004.
+          - alpha is free in [0.05, 1] instead of [0.175, 0.185].
+          - the upper bound on Rs is rs_max_rvir * rvir of that halo at that snapshot instead of bounds[1][1] (a fixed
+            50 kpc pinned the late-time MWest hosts at the bound).
+
+        If the Einasto fit fails -- fewer than min_fit_particles valid particles between r_conv and rvir, fewer than
+        min_fit_bins bins beyond r_conv, curve_fit fails, or (if bound_fallback) the fit ends on a bound of alpha,
+        log10_rho_s or the lower bound of Rs -- the halo is instead given the NFW profile with its Rockstar mass m inside rvir and
+        concentration cvir (from vmax / vvir, so the NFW reproduces Rockstar's vmax). A fit on a bound is not
+        constrained by the particles (typically small, stripped subhalos whose density is steeper than r^-2 at every
+        resolved radius, so r_-2 and alpha are set by unresolved scales), and the simulation's resolution does not
+        represent the true inner structure there either, so the NFW is used rather than the numerics. For MWest
+        Halo004 such NFWs matched the particle density in the fit range to ~0.11 dex rms vs ~0.08 dex for the bounded
+        Einasto fits. A fit with Rs on its rs_max_rvir * rvir upper bound is kept: it only means there is no density
+        turnover inside rvir, and the curve is still constrained in the fit range (e.g. the MWest Halo004 host at
+        snapshot 170 matched the particle tidal strength near r_conv far better than its NFW did); it is flagged in
+        hit_bounds. Untracked halos (not yet formed, or disrupted) are NaN.
 
         params[..., :] = (alpha, Rs, log10_rho_s). For both profiles Rs is r_-2 (the radius where dlog rho / dlog r
         = -2) in physical kpc, and rho_s = rho(r_-2) in Msun / kpc^3 (for NFW this is rho_0 / 4); alpha is NaN for
@@ -426,8 +510,12 @@ class SymphonyPotential(AgamaPotential):
         Returns a dict of the saved arrays:
             params (n_halos, n_snapshots, 3), profile_type (n_halos, n_snapshots; PROFILE_UNTRACKED = -1,
             PROFILE_EINASTO = 0, PROFILE_NFW = 1), n_fit_bins and n_fit_particles (n_halos, n_snapshots; bins /
-            particles beyond r_conv used or available for the Einasto fit), hit_bounds (Einasto fit ended on a bound
-            of Rs or log10_rho_s), halos (n_halos), snapshots, scale_factor, time (n_snapshots; Agama units),
+            particles beyond r_conv used or available for the Einasto fit), hit_bounds (the Einasto fit ended on a
+            bound of alpha, Rs or log10_rho_s; with bound_fallback the NFW was used instead unless only the
+            rvir-tied Rs bound was hit), fallback_reason
+            (FALLBACK_NONE = 0, FEW_PARTICLES = 1, FEW_BINS = 2, FIT_FAILED = 3, AT_BOUND = 4; 0 for Einasto and
+            untracked), einasto_params (n_halos, n_snapshots, 3; every completed Einasto fit, including rejected
+            ones, NaN otherwise), halos (n_halos), snapshots, scale_factor, time (n_snapshots; Agama units),
             r_conv (n_snapshots), m, rvir, cvir (n_halos, n_snapshots; Rockstar), param_names.
         '''
         path = os.path.join(self.write_dir, file_name)
@@ -448,6 +536,8 @@ class SymphonyPotential(AgamaPotential):
         n_fit_bins = np.zeros(shape, dtype=int)
         n_fit_particles = np.zeros(shape, dtype=int)
         hit_bounds = np.zeros(shape, dtype=bool)
+        fallback_reason = np.zeros(shape, dtype=np.int8)
+        einasto_params = np.full(shape + (3,), np.nan)
         r_conv_snap = np.array([get_convergence_radius(params, self.interface.scale_factors[s]) for s in snapshots])
         lo_b, hi_b = np.asarray(bounds[0], dtype=float), np.asarray(bounds[1], dtype=float)
 
@@ -470,7 +560,7 @@ class SymphonyPotential(AgamaPotential):
                 if rs_max_rvir is not None:
                     hi_h[1] = rs_max_rvir * rvir
 
-                popt = None
+                popt, reason = None, FALLBACK_FEW_PARTICLES
                 if n_out >= min_fit_particles:
                     # halo-scaled starting point, inside the bounds
                     m_in = mp * np.sum(r < rvir)
@@ -478,19 +568,33 @@ class SymphonyPotential(AgamaPotential):
                                     lo_h + 1e-6 * (hi_h - lo_h), hi_h - 1e-6 * (hi_h - lo_h))
                     try:
                         popt, nb = fit_einasto(r, mp, rvir, r_conv, bins=bins, p0=guess,
-                                               bounds=(lo_h, hi_h), maxfev=maxfev)
+                                               bounds=(lo_h, hi_h), maxfev=maxfev, binning=binning,
+                                               min_bin_count=min_bin_count)
                         n_fit_bins[i, j] = nb
-                        if nb < min_fit_bins or not np.all(np.isfinite(popt)):
-                            popt = None
+                        if not np.all(np.isfinite(popt)):
+                            popt, reason = None, FALLBACK_FIT_FAILED
+                        elif nb < min_fit_bins:
+                            popt, reason = None, FALLBACK_FEW_BINS
                     except (RuntimeError, ValueError, TypeError):
-                        popt = None
+                        popt, reason = None, FALLBACK_FIT_FAILED
+
+                if popt is not None:
+                    einasto_params[i, j] = popt
+                    tol = 1e-3 * (hi_h - lo_h)
+                    at_lo, at_hi = popt - lo_h < tol, hi_h - popt < tol
+                    hit_bounds[i, j] = np.any(at_lo | at_hi)
+                    # Rs = rs_max_rvir * rvir only means no density turnover inside rvir; the curve is still
+                    # constrained by the particles in the fit range, so it is kept as Einasto
+                    if rs_max_rvir is not None:
+                        at_hi[1] = False
+                    if bound_fallback and np.any(at_lo | at_hi):
+                        popt, reason = None, FALLBACK_AT_BOUND
 
                 if popt is not None:
                     out_params[i, j] = popt
                     profile_type[i, j] = PROFILE_EINASTO
-                    tol = 1e-3 * (hi_h[1:] - lo_h[1:])
-                    hit_bounds[i, j] = np.any((popt[1:] - lo_h[1:] < tol) | (hi_h[1:] - popt[1:] < tol))
                 else:
+                    fallback_reason[i, j] = reason
                     Rs, log_rho_s = nfw_from_mass(rs['m'][h, snapshot], rvir, rs['cvir'][h, snapshot])
                     out_params[i, j] = (np.nan, Rs, log_rho_s)
                     profile_type[i, j] = PROFILE_NFW
@@ -499,11 +603,13 @@ class SymphonyPotential(AgamaPotential):
         rvir = np.where(profile_type != PROFILE_UNTRACKED, rs['rvir'][halos][:, snapshots], np.nan)
         cvir = np.where(profile_type != PROFILE_UNTRACKED, rs['cvir'][halos][:, snapshots], np.nan)
         out = dict(params=out_params, profile_type=profile_type, n_fit_bins=n_fit_bins,
-                   n_fit_particles=n_fit_particles, hit_bounds=hit_bounds, halos=halos, snapshots=snapshots,
+                   n_fit_particles=n_fit_particles, hit_bounds=hit_bounds, fallback_reason=fallback_reason,
+                   einasto_params=einasto_params, bound_fallback=bound_fallback, halos=halos, snapshots=snapshots,
                    scale_factor=self.interface.scale_factors[snapshots], time=self._agama_times()[snapshots],
                    r_conv=r_conv_snap, m=m, rvir=rvir, cvir=cvir,
                    param_names=np.array(['alpha', 'Rs', 'log10_rho_s']),
-                   rs_max_rvir=np.nan if rs_max_rvir is None else rs_max_rvir)
+                   rs_max_rvir=np.nan if rs_max_rvir is None else rs_max_rvir, binning=binning,
+                   bounds=np.asarray(bounds, dtype=float))
         np.savez_compressed(path, **out)
         return out
 
