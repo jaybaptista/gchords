@@ -14,7 +14,7 @@ from scipy.stats import lognorm
 import symlib
 from scipy.stats import norm, truncnorm
 from gchords.tag import GlobularClusterRhalf
-from gchords.mah import mean_mah, cosmo
+from gchords.mah import mean_mah, median_mah, cosmo
 
 
 class AgeModel(abc.ABC):
@@ -425,7 +425,7 @@ class DornanOccupationModelInSitu(OccupationModel):
     In-situ variant of DornanOccupationModel.
 
     Builds an interpolator over (log_mhalo, lookback_time) => p_gc by tracing
-    each halo's mean MAH and anchoring p_gc to the z=0 peak halo mass via the
+    each halo's median MAH and anchoring p_gc to the z=0 peak halo mass via the
     Dornan logistic relation.
     """
 
@@ -449,7 +449,7 @@ class DornanOccupationModelInSitu(OccupationModel):
         log_mhalo_pts, t_pts, p_gc_vals = [], [], []
 
         for mass in masses:
-            zs, m_track = mean_mah(mass, z_eval=z_eval)
+            zs, m_track = median_mah(mass, z_eval=z_eval)
             p_z0 = self._p_gc_z0(m_track[0])
             t = np.array([cosmo.age(z) for z in zs])
             log_mhalo_pts.extend(np.log10(m_track))
@@ -589,7 +589,7 @@ class GCSDornanMassInSitu(GCSMassModel):
     ):
         """
         In-situ GCS mass model using the Dornan mass-halo relation evaluated along
-        each halo's mean MAH, then interpolated over (halo_mass, redshift).
+        each halo's median MAH, then interpolated over (halo_mass, redshift).
         """
         super().__init__(seed=seed)
         self.kind = "halo"
@@ -609,7 +609,7 @@ class GCSDornanMassInSitu(GCSMassModel):
         log_mhalo_pts, t_pts, log_mgcs_vals = [], [], []
 
         for mass in masses:
-            zs, m_track = mean_mah(mass, z_eval=z_eval)
+            zs, m_track = median_mah(mass, z_eval=z_eval)
             log_mgcs = np.log10(dornan.mass(m_track[0]))
             t = np.array([cosmo.age(z) for z in zs])
             log_mhalo_pts.extend(np.log10(m_track))
