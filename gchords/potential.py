@@ -492,14 +492,45 @@ class SymphonyPotential(AgamaPotential):
             for f in os.listdir(self.write_dir) if f.startswith('snap_') and f.endswith('.ini')
         )
 
+    def _snapshots_to_build(self, snapshots, overwrite, sub_dir=None):
+        '''
+        Snapshots (from `snapshots`) that still need a host file. On a resume, the newest existing host file (and its
+        subhalo files) is removed and rebuilt in case an older, non-atomic run left it truncated; every snapshot
+        without a host file is (re)built, so snapshots finished out of order by parallel workers are kept.
+        '''
+        if overwrite:
+            return list(snapshots)
+        existing = self._existing_snapshot_numbers()
+        if existing:
+            newest = existing[-1]
+            print(f"Found an incomplete potential -- rebuilding snapshot {newest} (in case a previous failed run "
+                  f"left it corrupted) and every snapshot without a file.")
+            os.remove(os.path.join(self.write_dir, f'snap_{newest}.ini'))
+            if sub_dir is not None:
+                for k, f in self._subhalo_snapshot_files(sub_dir):
+                    if k == newest:
+                        os.remove(f)
+            existing = set(existing[:-1])
+        return [s for s in snapshots if s not in existing]
+
+    @staticmethod
+    def _export_atomic(pot, path):
+        # write next to the target and rename, so an interrupted run never leaves a truncated .ini behind
+        tmp = f"{path}.tmp{os.getpid()}"
+        pot.export(tmp)
+        os.replace(tmp, path)
+
     def construct_potential(self, lmax, rmin=1e-2, rmax_rvir=1.2, nrad=25, mode='all', min_particles=100, symmetry='None', stride=1, overwrite=False,
-                            spherical_profile=False, spherical_profile_kwargs=None):
+                            spherical_profile=False, spherical_profile_kwargs=None, n_workers=1):
         '''
         Builds the host's evolving multipole potential in write_dir. If spherical_profile is True, also fits the
         Einasto / NFW spherical approximation of every halo at every snapshot (SymphonyPotential.spherical_profile,
         called with spherical_profile_kwargs) into write_dir/spherical_profile.npz -- this runs even when the
         multipole potential already exists and is not rebuilt. An existing spherical_profile.npz is only recomputed
         if spherical_profile_kwargs contains overwrite=True.
+
+        n_workers: build the snapshots in parallel on this many forked worker processes (each reads one snapshot's
+        particles at a time, so memory grows with n_workers). Snapshots are independent; 1 = serial.
         '''
         os.makedirs(self.write_dir, exist_ok=True)
 
@@ -510,30 +541,15 @@ class SymphonyPotential(AgamaPotential):
             print("Potential already exists. Use `overwrite=True` to reconstruct potential.")
             return
 
-        if overwrite:
-            start_snapshot_loop = 0
-        else:
-            existing = self._existing_snapshot_numbers()
-            if existing:
-                resume_snapshot = existing[-1]
-                print(
-                    f"Found an incomplete potential -- resuming construction from snapshot "
-                    f"{resume_snapshot}, which is regenerated in case it was left corrupted "
-                    f"by a previous failed run."
-                )
-                os.remove(os.path.join(self.write_dir, f'snap_{resume_snapshot}.ini'))
-                start_snapshot_loop = resume_snapshot
-            else:
-                start_snapshot_loop = 0
+        todo = self._snapshots_to_build(range(len(self.interface.scale_factors)), overwrite)
 
-        for snapshot in tqdm(range(start_snapshot_loop, len(self.interface.scale_factors)), desc="Constructing potentials..."):
-
+        def build(snapshot):
             p_snap = self.interface.particles.read(snapshot, mode=mode, halo=0)
             x = p_snap['x'][p_snap['ok']]
 
             if len(x) < min_particles:
                 # skip this snapshot if there are too few particles to construct a reliable potential
-                continue
+                return
 
             m = self.interface.mp * np.ones(len(x))
 
@@ -547,7 +563,11 @@ class SymphonyPotential(AgamaPotential):
                 particles=(x, m)
             )
 
-            potential.export(os.path.join(self.write_dir, f'snap_{snapshot}.ini'))
+            self._export_atomic(potential, os.path.join(self.write_dir, f'snap_{snapshot}.ini'))
+
+        from gchords.parallel import run_chunked
+        run_chunked(lambda chunk: [build(s) for s in chunk], todo, n_workers=n_workers, chunk_size=1,
+                    desc=f"Constructing potentials ({n_workers} workers)...")
 
         existing_snapshots = set(self._existing_snapshot_numbers())
         start_snapshot = min(existing_snapshots)
@@ -791,7 +811,7 @@ class SymphonyPotential(AgamaPotential):
         return out
 
     def construct_potential_subhalo(self, subhalo_model, lmax, rmin=1e-2, rmax_rvir=1.2, nrad=25, mode='all',
-                                    min_particles=100, symmetry='None', snapshots=None, overwrite=False):
+                                    min_particles=100, symmetry='None', snapshots=None, overwrite=False, n_workers=1):
         '''
         Like construct_potential, but the material bound to each subhalo gets its own potential instead of being
         part of the host's multipole.
@@ -814,9 +834,12 @@ class SymphonyPotential(AgamaPotential):
         inside that range with no potential (too few bound particles) are interpolated across. The model settings
         are written to subhalo_model.json.
 
-        Construction resumes after a failure like construct_potential (the host file of each snapshot is written
-        last, and the last snapshot found is rebuilt). overwrite=True deletes this directory's snap_*.ini and
-        subhalos/ first. snapshots restricts construction to those snapshots (default: all; mainly for testing).
+        Construction resumes after a failure like construct_potential: every file is written atomically, the host
+        file of a snapshot is written after its subhalo files, and every snapshot without a host file is rebuilt (its
+        stale subhalo files removed first). overwrite=True deletes this directory's snap_*.ini and subhalos/ first.
+        snapshots restricts construction to those snapshots (default: all; mainly for testing). n_workers builds
+        snapshots in parallel on forked worker processes, as in construct_potential (each worker holds one
+        snapshot's particles for every halo, ~1-2 GB for an MWest host).
         '''
         import json
         import shutil
@@ -837,30 +860,25 @@ class SymphonyPotential(AgamaPotential):
             for k in self._existing_snapshot_numbers():
                 os.remove(os.path.join(self.write_dir, f'snap_{k}.ini'))
             shutil.rmtree(sub_dir, ignore_errors=True)
-            start = snapshots[0]
-        else:
-            existing = self._existing_snapshot_numbers()
-            start = snapshots[0]
-            if existing:
-                start = existing[-1]
-                print(f"Found an incomplete potential -- resuming construction from snapshot {start}, which is "
-                      f"regenerated in case it was left corrupted by a previous failed run.")
-                os.remove(os.path.join(self.write_dir, f'snap_{start}.ini'))
-                # subhalo files of the snapshot being redone (and any later) are rewritten too
-                for k, f in self._subhalo_snapshot_files(sub_dir):
-                    if k >= start:
-                        os.remove(f)
+        todo = self._snapshots_to_build([int(s) for s in snapshots], overwrite, sub_dir=sub_dir)
+        stale = {}
+        for k, f in self._subhalo_snapshot_files(sub_dir):
+            stale.setdefault(k, []).append(f)
 
         rs, params, mp = self.interface.rs, self.interface.params, self.interface.mp
         first_infall = np.asarray(self.interface.hist['first_infall_snap'])
         n_halo = rs.shape[0]
         n_min = subhalo_model.min_particles
 
-        for snapshot in tqdm(snapshots[snapshots >= start], desc="Constructing host + subhalo potentials..."):
+        def build(snapshot):
+            # subhalo files left by an interrupted build of this snapshot
+            for f in stale.get(snapshot, []):
+                if os.path.exists(f):
+                    os.remove(f)
             p_all = self.interface.particles.read(snapshot, mode=mode)
             host = p_all[0]
             if np.sum(host['ok']) < min_particles:
-                continue
+                return
             r_conv = get_convergence_radius(params, self.interface.scale_factors[snapshot])
 
             # bound particles of every subhalo inside the host
@@ -901,7 +919,7 @@ class SymphonyPotential(AgamaPotential):
                         continue
                     d = os.path.join(sub_dir, f'halo_{i}')
                     os.makedirs(d, exist_ok=True)
-                    pot.export(os.path.join(d, f'snap_{snapshot}.ini'))
+                    self._export_atomic(pot, os.path.join(d, f'snap_{snapshot}.ini'))
                     claimed.append(ids[sel])
 
             # host: valid host particles not represented by a subhalo potential
@@ -910,7 +928,7 @@ class SymphonyPotential(AgamaPotential):
                 in_host = in_host & ~np.isin(host['id'], np.concatenate(claimed))
             x = host['x'][in_host]
             if len(x) < min_particles:
-                continue
+                return
 
             potential = agama.Potential(
                 type='Multipole',
@@ -922,7 +940,11 @@ class SymphonyPotential(AgamaPotential):
                 particles=(x, mp * np.ones(len(x)))
             )
             # written last, so its presence marks the snapshot as complete for resuming
-            potential.export(os.path.join(self.write_dir, f'snap_{snapshot}.ini'))
+            self._export_atomic(potential, os.path.join(self.write_dir, f'snap_{snapshot}.ini'))
+
+        from gchords.parallel import run_chunked
+        run_chunked(lambda chunk: [build(s) for s in chunk], todo, n_workers=n_workers, chunk_size=1,
+                    desc=f"Constructing host + subhalo potentials ({n_workers} workers)...")
 
         self._write_subhalo_potential_ini(sub_dir)
         with open(os.path.join(self.write_dir, 'subhalo_model.json'), 'w') as f:

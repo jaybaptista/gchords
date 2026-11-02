@@ -366,43 +366,64 @@ class GChords(object):
         self.particle_tags["particle_index"] = self.particle_tags["nimbus_index"] + starts[self.particle_tags["halo_index"]]
         return self.particle_tags["particle_index"].unique()
 
-    def compute_cluster_tidal_field(self, potential, write_dir='tidal_field.npz'):
+    def compute_cluster_tidal_field(self, potential, write_dir='tidal_field.npz', batch_size=1):
+        '''
+        Tidal strength along every tracked particle's orbit (100 samples per snapshot from its first snapshot).
+
+        batch_size: number of orbits whose samples are evaluated in one potential.tidal_strength call. Each point is
+        evaluated independently, so the result does not depend on it; larger batches give agama's OpenMP threads
+        more points per call (useful for many-component subhalo potentials). 1 = one call per orbit.
+        '''
         if self.particle_tracks is None:
             raise ValueError("No particle tracks found. Run track_clusters() first.")
-        
-        _t = []
-        _st = []
-        _int_st = []
+
+        n_tracks = self.particle_tracks.shape[1]
+        _t = [None] * n_tracks
+        _st = [None] * n_tracks
+        _int_st = [None] * n_tracks
 
         age_int = self.interface.cosmology.age(1/self.interface.scale_factors - 1) / 0.97779222
 
-        for k in tqdm(range(self.particle_tracks.shape[1])):
-            xv = self.particle_tracks[:, k, :]
-            start_snapshot = np.where(~np.isnan(xv[:, 0]))[0][0]
-            xv = xv[start_snapshot:]
+        with tqdm(total=n_tracks) as bar:
+            for b0 in range(0, n_tracks, max(1, int(batch_size))):
+                batch = []
+                for k in range(b0, min(n_tracks, b0 + max(1, int(batch_size)))):
+                    xv = self.particle_tracks[:, k, :]
+                    start_snapshot = np.where(~np.isnan(xv[:, 0]))[0][0]
+                    xv = xv[start_snapshot:]
 
-            if start_snapshot == len(self.interface.scale_factors) - 1:
-                _t.append([None])
-                _st.append([None])
-                _int_st.append(0.0)
-                continue
+                    if start_snapshot == len(self.interface.scale_factors) - 1:
+                        _t[k] = [None]
+                        _st[k] = [None]
+                        _int_st[k] = 0.0
+                        continue
 
-            spl = [
-                UnivariateSpline(
-                    age_int[start_snapshot:], xv[:, i], s=0, k=min(3, len(age_int[start_snapshot:]) - 1)
-                )
-                for i in range(3)
-            ]
+                    spl = [
+                        UnivariateSpline(
+                            age_int[start_snapshot:], xv[:, i], s=0, k=min(3, len(age_int[start_snapshot:]) - 1)
+                        )
+                        for i in range(3)
+                    ]
 
-            N_samples = 100 * len(age_int[start_snapshot:]) # sample 100 points per snapshot
+                    N_samples = 100 * len(age_int[start_snapshot:]) # sample 100 points per snapshot
 
-            t_sample = np.linspace(age_int[start_snapshot], age_int[-1], N_samples)
-            x_sample = np.array([spl_i(t_sample) for spl_i in spl]).T
-            st_sample = potential.tidal_strength(x_sample, t=t_sample / 0.97779222) * 1.0459401725324529
-            _t.append(t_sample)
-            _st.append(st_sample)
-            spl_st = PchipInterpolator(t_sample, np.sqrt(st_sample)) # root of tidal frequency is `tidal strength`
-            _int_st.append(spl_st.integrate(t_sample[0], t_sample[-1]))
+                    t_sample = np.linspace(age_int[start_snapshot], age_int[-1], N_samples)
+                    x_sample = np.array([spl_i(t_sample) for spl_i in spl]).T
+                    batch.append((k, t_sample, x_sample))
+
+                if batch:
+                    x_all = np.concatenate([b[2] for b in batch])
+                    t_all = np.concatenate([b[1] for b in batch])
+                    st_all = np.atleast_1d(potential.tidal_strength(x_all, t=t_all / 0.97779222)) * 1.0459401725324529
+                    off = 0
+                    for k, t_sample, _ in batch:
+                        st_sample = st_all[off:off + len(t_sample)]
+                        off += len(t_sample)
+                        _t[k] = t_sample
+                        _st[k] = st_sample
+                        spl_st = PchipInterpolator(t_sample, np.sqrt(st_sample)) # root of tidal frequency is `tidal strength`
+                        _int_st[k] = spl_st.integrate(t_sample[0], t_sample[-1])
+                bar.update(min(n_tracks, b0 + max(1, int(batch_size))) - b0)
 
         np.savez_compressed(
             write_dir,
@@ -539,7 +560,7 @@ class GChords(object):
         return out
 
     def compute_cluster_masses(self, tidal_data, mass_loss_model, write_dir='particles_evolved.csv', integrated=False,
-                               circular_tidal_data=None):
+                               circular_tidal_data=None, n_workers=1):
         '''
         Compute the evolved masses of star clusters over time
 
@@ -547,6 +568,9 @@ class GChords(object):
         circular_tidal_data: output of compute_cluster_circular_tidal_field (dict or npz), needed by mass loss
             models with requires_circular_tidal_field (e.g. CircularOrbitMassLossModel); defaults to the one
             computed in this session.
+        n_workers: with integrated=False, evolve the clusters in chunks on this many forked worker processes
+            (gchords.parallel.run_chunked). Each cluster is integrated independently, so the masses do not depend
+            on it. 1 = the serial loop.
         '''
         needs_circ = getattr(mass_loss_model, "requires_circular_tidal_field", False)
         if needs_circ:
@@ -564,6 +588,31 @@ class GChords(object):
         if integrated:
             st = tidal_data["integrated_tidal_field"]
             self.particle_tags["evolved_mass"] = mass_loss_model.evolve_mass(initial_mass=self.particle_tags["gc_mass"].values, time=0.0, tidal_strength=st, integrated=True)
+        elif n_workers > 1:
+            t = tidal_data["time"]
+            st = tidal_data["tidal_field"]
+            pos_of = [self.index_to_pos[p] for p in self.particle_tags["particle_index"].values]
+            m0 = self.particle_tags["gc_mass"].values
+
+            def evolve_chunk(rows):
+                out = []
+                for i in rows:
+                    t_i, st_i = t[pos_of[i]], st[pos_of[i]]
+                    if len(t_i) < 2:
+                        # untracked cluster: no mass loss, as in the serial loop below
+                        out.append(m0[i])
+                        continue
+                    extra = {}
+                    if needs_circ:
+                        extra = dict(circular_time=circ_t, circular_tidal_strength=circ_ts[:, pos_of[i]])
+                    out.append(mass_loss_model.evolve_mass(initial_mass=m0[i], time=t_i, tidal_strength=st_i,
+                                                           integrated=False, **extra))
+                return out
+
+            from gchords.parallel import run_chunked
+            chunks = run_chunked(evolve_chunk, range(len(self.particle_tags)), n_workers=n_workers,
+                                 desc=f"Numerically evolving cluster masses ({n_workers} workers, chunks)...")
+            self.particle_tags["evolved_mass"] = np.array([m for c in chunks for m in c], dtype=float)
         else:
             t = tidal_data["time"]
             st = tidal_data["tidal_field"]
